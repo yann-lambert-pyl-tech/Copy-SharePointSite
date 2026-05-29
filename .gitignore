@@ -1,3 +1,5 @@
 _SPCopy_Logs/
 *.log
 *.pnp
+.DS_Store
+.claude/
