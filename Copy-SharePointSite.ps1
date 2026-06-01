@@ -1,25 +1,49 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Duplique un site SharePoint Online complet vers un NOUVEAU site cible.
+    Duplique un site SharePoint Online complet, OU clone une équipe Microsoft Teams.
 
 .DESCRIPTION
     Script robuste, structuré en "streams" (#region), couvrant les standards :
       - Authentification (PnP.PowerShell interactif, MFA-friendly)
       - Journalisation (fichier log horodaté + transcript + console colorée)
       - Interface de suivi (Write-Progress multi-niveaux + résumé final)
-      - Gestion d'erreurs + retry avec back-off exponentiel
+      - Gestion d'erreurs + retry avec back-off exponentiel (transitoires only)
       - Mode -WhatIf / -DryRun (aucune écriture côté cible)
+      - ACL optionnelles (-IncludePermissions)
 
-    Pipeline fonctionnel :
-      1. Pré-requis (module PnP.PowerShell)
-      2. Connexion site SOURCE
-      3. Extraction du modèle PnP (structure : listes, champs, content types,
-         pages, navigation, permissions, paramètres, + éléments de liste)
-      4. Provisioning du NOUVEAU site CIBLE (New-PnPSite)
-      5. Application du modèle sur la cible (Invoke-PnPSiteTemplate)
-      6. Copie du contenu des bibliothèques de documents (fichiers + dossiers)
-      7. Vérification + rapport final
+    Deux modes (parameter sets) :
+
+    MODE SITE (défaut) — duplique un site SharePoint vers un NOUVEAU site :
+      1. Connexion site SOURCE
+      2. Extraction du modèle PnP (listes, champs, content types, pages,
+         navigation, paramètres ; + SiteSecurity si -IncludePermissions)
+      3. Provisioning du NOUVEAU site CIBLE (New-PnPSite)
+      4. Application du modèle (Invoke-PnPSiteTemplate)
+      5. Copie du contenu des bibliothèques (download/upload cross-site)
+      6. Vérification + rapport final
+
+    MODE TEAM (-SourceTeamId) — clone une équipe Microsoft Teams via Graph :
+      Canaux, onglets, apps et paramètres clonés ; membres/owners (ACL) seulement
+      si -IncludePermissions. Le site SharePoint de l'équipe est recréé d'office.
+
+.PARAMETER IncludePermissions
+    Copie les ACL. Mode SITE : inclut le handler SiteSecurity (groupes/rôles).
+    Mode TEAM : ajoute 'members' aux éléments clonés (membres + owners).
+    Par défaut désactivé (le nouveau site/équipe repart sur des permissions propres).
+
+.PARAMETER SourceTeamId
+    (Mode TEAM) GUID de l'équipe Microsoft Teams source à cloner.
+
+.PARAMETER NewTeamName
+    (Mode TEAM) Nom d'affichage de la nouvelle équipe clonée.
+
+.PARAMETER TenantUrl
+    (Mode TEAM) URL racine SharePoint du tenant pour la connexion Graph.
+    Ex: https://contoso.sharepoint.com
+
+.PARAMETER Visibility
+    (Mode TEAM) Visibilité de la nouvelle équipe : Private (défaut) ou Public.
 
 .PARAMETER SourceUrl
     URL complète du site SharePoint source. Ex: https://contoso.sharepoint.com/sites/Source
@@ -50,13 +74,20 @@
     Simulation : exécute extraction + diagnostics mais N'ÉCRIT RIEN côté cible.
 
 .EXAMPLE
+    # Site, avec contenu ET permissions (ACL)
     .\Copy-SharePointSite.ps1 -SourceUrl https://contoso.sharepoint.com/sites/Modele `
         -TargetUrl https://contoso.sharepoint.com/sites/Modele-Copie `
-        -Owner admin@contoso.com -IncludeContent
+        -Owner admin@contoso.com -IncludeContent -IncludePermissions
 
 .EXAMPLE
-    # Test à blanc, sans rien créer côté cible
+    # Site, test à blanc, sans rien créer côté cible
     .\Copy-SharePointSite.ps1 -SourceUrl ... -TargetUrl ... -Owner admin@contoso.com -DryRun
+
+.EXAMPLE
+    # Teams, clone complet avec les membres (ACL)
+    .\Copy-SharePointSite.ps1 -SourceTeamId 0a1b2c3d-4e5f-6789-abcd-ef0123456789 `
+        -NewTeamName "Projet Alpha (copie)" -TenantUrl https://contoso.sharepoint.com `
+        -IncludePermissions
 
 .NOTES
     Auteur  : Pyl.Tech
@@ -64,28 +95,50 @@
     Auth    : PnP interactif (navigateur + MFA). Admin tenant requis pour créer le site.
 #>
 
-[CmdletBinding(SupportsShouldProcess = $true)]
+[CmdletBinding(SupportsShouldProcess = $true, DefaultParameterSetName = 'Site')]
 param(
-    [Parameter(Mandatory = $true)]
+    # --- Jeu de paramètres SITE (duplication d'un site SharePoint) ---
+    [Parameter(Mandatory = $true, ParameterSetName = 'Site')]
     [ValidatePattern('^https://.+\.sharepoint\.com/(sites|teams)/.+')]
     [string]$SourceUrl,
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'Site')]
     [ValidatePattern('^https://.+\.sharepoint\.com/(sites|teams)/.+')]
     [string]$TargetUrl,
 
-    [Parameter(Mandatory = $false)]
+    [Parameter(Mandatory = $false, ParameterSetName = 'Site')]
     [string]$TargetTitle,
 
-    [Parameter(Mandatory = $false)]
+    [Parameter(Mandatory = $false, ParameterSetName = 'Site')]
     [ValidateSet('CommunicationSite', 'TeamSite')]
     [string]$TargetType = 'CommunicationSite',
 
-    [Parameter(Mandatory = $false)]
+    [Parameter(Mandatory = $false, ParameterSetName = 'Site')]
     [string]$Owner,
 
-    [Parameter(Mandatory = $false)]
+    [Parameter(Mandatory = $false, ParameterSetName = 'Site')]
     [switch]$IncludeContent,
+
+    # --- Jeu de paramètres TEAM (clonage d'une équipe Microsoft Teams via Graph) ---
+    [Parameter(Mandatory = $true, ParameterSetName = 'Team')]
+    [ValidatePattern('^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$')]
+    [string]$SourceTeamId,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'Team')]
+    [string]$NewTeamName,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'Team')]
+    [ValidatePattern('^https://.+\.sharepoint\.com')]
+    [string]$TenantUrl,
+
+    [Parameter(Mandatory = $false, ParameterSetName = 'Team')]
+    [ValidateSet('Private', 'Public')]
+    [string]$Visibility = 'Private',
+
+    # --- Paramètres communs aux deux modes ---
+    # ACL : copie des permissions (groupes/rôles du site, ou membres/owners de l'équipe).
+    [Parameter(Mandatory = $false)]
+    [switch]$IncludePermissions,
 
     [Parameter(Mandatory = $false)]
     [string]$ClientId,
@@ -130,8 +183,19 @@ function Write-Log {
     }
 }
 
+function Test-TransientError {
+    # Vrai uniquement pour les erreurs rejouables (throttling / indispo / timeout réseau).
+    param([Parameter(Mandatory = $true)]$ErrorRecord)
+    $msg    = $ErrorRecord.Exception.Message
+    $status = $null
+    try { $status = [int]$ErrorRecord.Exception.Response.StatusCode } catch {}
+    if ($status -in 429, 500, 502, 503, 504) { return $true }
+    return ($msg -match '(?i)throttl|too many requests|temporarily|timed?\s*out|service unavailable|connection (was )?(reset|closed)|operation has timed out')
+}
+
 function Invoke-WithRetry {
-    # Exécute un scriptblock avec retry + back-off exponentiel (throttling SPO 429, transitoires).
+    # Exécute un scriptblock avec retry + back-off exponentiel, UNIQUEMENT sur erreurs transitoires.
+    # Une erreur définitive (404, auth, paramètre invalide) est relancée immédiatement.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][scriptblock]$Action,
@@ -144,12 +208,17 @@ function Invoke-WithRetry {
             return & $Action
         }
         catch {
+            $isTransient = Test-TransientError -ErrorRecord $_
+            if (-not $isTransient) {
+                Write-Log "Échec non transitoire de '$Operation' : $($_.Exception.Message)" 'ERROR'
+                throw
+            }
             if ($attempt -eq $MaxAttempts) {
                 Write-Log "Échec définitif de '$Operation' après $MaxAttempts tentatives : $($_.Exception.Message)" 'ERROR'
                 throw
             }
             $delay = $BaseDelaySec * [math]::Pow(2, $attempt - 1)
-            Write-Log "Échec de '$Operation' (tentative $attempt/$MaxAttempts) : $($_.Exception.Message). Nouvel essai dans ${delay}s." 'WARN'
+            Write-Log "Erreur transitoire sur '$Operation' (tentative $attempt/$MaxAttempts) : $($_.Exception.Message). Nouvel essai dans ${delay}s." 'WARN'
             Start-Sleep -Seconds $delay
         }
     }
@@ -213,7 +282,19 @@ function Export-SourceTemplate {
     Write-Log "Extraction du modèle PnP du site source..." 'STEP'
     Write-Progress -Id 1 -Activity 'Duplication SharePoint' -Status 'Extraction du modèle source' -PercentComplete 20
 
-    $handlers = 'Lists,Fields,ContentTypes,Pages,PageContents,Navigation,SiteSecurity,RegionalSettings,SupportedUILanguages,Files,WebSettings,Publishing'
+    # ACL : on n'inclut le handler SiteSecurity (groupes, rôles, attributions) que si demandé.
+    $handlerList = [System.Collections.Generic.List[string]]@(
+        'Lists', 'Fields', 'ContentTypes', 'Pages', 'PageContents', 'Navigation',
+        'RegionalSettings', 'SupportedUILanguages', 'Files', 'WebSettings', 'Publishing'
+    )
+    if ($IncludePermissions) {
+        $handlerList.Add('SiteSecurity')
+        Write-Log "ACL activées : permissions du site incluses (groupes/rôles)." 'INFO'
+    }
+    else {
+        Write-Log "ACL désactivées : permissions NON copiées (héritage par défaut du nouveau site)." 'INFO'
+    }
+    $handlers = $handlerList -join ','
     $params = @{
         Out           = $script:TemplateFile
         Handlers      = $handlers
@@ -266,10 +347,12 @@ function New-TargetSite {
         return
     }
 
-    $siteParams = @{ Url = $TargetUrl; Title = $TargetTitle; Connection = $adminConn; ErrorAction = 'Stop' }
+    # NB : seul CommunicationSite accepte -Url ; TeamSite dérive son URL de -Alias.
+    $siteParams = @{ Title = $TargetTitle; Connection = $adminConn; ErrorAction = 'Stop' }
     switch ($TargetType) {
         'CommunicationSite' {
             $siteParams['Type'] = 'CommunicationSite'
+            $siteParams['Url']  = $TargetUrl
             if ($Owner) { $siteParams['Owner'] = $Owner }
         }
         'TeamSite' {
@@ -280,8 +363,19 @@ function New-TargetSite {
     }
 
     Invoke-WithRetry -Operation 'création du site' -Action { New-PnPSite @siteParams } | Out-Null
-    Write-Log "Site cible créé. Attente de la propagation (15s)..." 'OK'
-    Start-Sleep -Seconds 15
+    Write-Log "Site cible créé. Attente de la propagation (statut Active)..." 'OK'
+
+    # Polling du statut plutôt qu'un sleep fixe : on attend que le site soit réellement provisionné.
+    $deadline = (Get-Date).AddMinutes(5)
+    do {
+        Start-Sleep -Seconds 5
+        $site = $null
+        try { $site = Get-PnPTenantSite -Url $TargetUrl -Connection $adminConn -ErrorAction SilentlyContinue } catch {}
+        $status = if ($site) { "$($site.Status)" } else { 'Provisioning' }
+    } while ($status -ne 'Active' -and (Get-Date) -lt $deadline)
+
+    if ($status -eq 'Active') { Write-Log "Site cible actif." 'OK' }
+    else { Write-Log "Délai d'attente dépassé (statut: $status). L'application du modèle peut échouer." 'WARN' }
 }
 #endregion
 
@@ -338,36 +432,50 @@ function Copy-LibrariesContent {
             Get-PnPListItem -List $lib -PageSize 500 -Connection $SourceConn -Fields 'FileLeafRef', 'FileRef', 'FSObjType'
         }
 
-        $n = 0; $total = [math]::Max($items.Count, 1)
-        foreach ($item in $items) {
+        # Préfixe de chemin (web) décodé : FileRef est non-échappé, AbsolutePath est échappé.
+        $srcWebPath = [uri]::UnescapeDataString(([uri]$SourceUrl).AbsolutePath)
+
+        # Dossiers d'abord, puis par profondeur croissante : la structure existe avant les fichiers.
+        $ordered = $items | Sort-Object `
+            @{ Expression = { if ($_['FSObjType'] -eq 1) { 0 } else { 1 } } }, `
+            @{ Expression = { "$($_['FileRef'])".Split('/').Count } }
+
+        $n = 0; $total = [math]::Max($ordered.Count, 1)
+        foreach ($item in $ordered) {
             $n++
             $serverRel = $item['FileRef']
             $isFolder  = ($item['FSObjType'] -eq 1)
-            $leaf      = $item['FileLeafRef']
+            $leaf       = $item['FileLeafRef']
             Write-Progress -Id 2 -ParentId 1 -Activity "Bibliothèque '$($lib.Title)'" `
                 -Status "$n/$total : $leaf" -PercentComplete (($n / $total) * 100)
 
-            # Chemin relatif au site, réécrit vers l'URL du site cible.
-            $relToWeb   = $serverRel.Substring(([uri]$SourceUrl).AbsolutePath.Length).TrimStart('/')
-            $targetPath = (([uri]$TargetUrl).AbsolutePath.TrimEnd('/')) + '/' + $relToWeb
-            $targetDir  = $targetPath.Substring(0, $targetPath.LastIndexOf('/'))
+            # Chemin relatif au web (sans le préfixe du site source), puis dossier parent côté cible.
+            $relToWeb     = $serverRel.Substring($srcWebPath.Length).TrimStart('/')
+            $parentRelDir = if ($relToWeb.Contains('/')) { $relToWeb.Substring(0, $relToWeb.LastIndexOf('/')) } else { '' }
 
             if ($DryRun) {
-                Write-Log "[DRYRUN] Copierait : $serverRel -> $targetPath" 'DEBUG'
+                Write-Log "[DRYRUN] Copierait : $serverRel -> <cible>/$relToWeb" 'DEBUG'
                 if ($isFolder) { $stats.Folders++ } else { $stats.Files++ }
                 continue
             }
 
             try {
                 if ($isFolder) {
-                    Resolve-PnPFolder -SiteRelativePath ($targetDir.Substring(([uri]$TargetUrl).AbsolutePath.Length).TrimStart('/')) `
-                        -Connection $TargetConn -ErrorAction Stop | Out-Null
+                    # Crée l'arborescence (site-relative) côté cible.
+                    Resolve-PnPFolder -SiteRelativePath $relToWeb -Connection $TargetConn -ErrorAction Stop | Out-Null
                     $stats.Folders++
                 }
                 else {
+                    # 1) Garantir le dossier parent côté cible (supprime toute dépendance d'ordre).
+                    if ($parentRelDir) {
+                        Resolve-PnPFolder -SiteRelativePath $parentRelDir -Connection $TargetConn -ErrorAction Stop | Out-Null
+                    }
+                    # 2) Copie cross-site fiable : download (source) -> upload (cible).
+                    #    Évite la limite same-site-collection de Copy-PnPFile.
                     Invoke-WithRetry -Operation "copie '$leaf'" -Action {
-                        Copy-PnPFile -SourceUrl $serverRel -TargetUrl $targetDir `
-                            -Force -OverwriteIfAlreadyExists -Connection $SourceConn -ErrorAction Stop
+                        $stream = Get-PnPFile -Url $serverRel -AsMemoryStream -Connection $SourceConn -ErrorAction Stop
+                        Add-PnPFile -FileName $leaf -Folder $parentRelDir -Stream $stream `
+                            -Connection $TargetConn -ErrorAction Stop | Out-Null
                     } | Out-Null
                     $stats.Files++
                 }
@@ -433,33 +541,131 @@ function Write-FinalReport {
 }
 #endregion
 
+#region ░░ STREAM 8bis : Clonage d'une équipe Teams (Graph) ░░░░░░░░░░░░░░░░░░░░░
+# Clone une équipe Microsoft Teams complète via l'API Graph (clone team).
+# Le clone inclut canaux, onglets, apps et paramètres ; les membres/owners (ACL)
+# ne sont clonés que si -IncludePermissions est fourni. Le SharePoint sous-jacent
+# (site de l'équipe) est recréé automatiquement par le clonage.
+
+function Connect-Tenant {
+    # Connexion interactive pour les opérations Graph/Teams (token Graph via PnP).
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Url)
+    Write-Log "Connexion interactive (Graph/Teams) : $Url" 'STEP'
+    $params = @{ Url = $Url; Interactive = $true; ReturnConnection = $true; ErrorAction = 'Stop' }
+    if ($ClientId) { $params['ClientId'] = $ClientId }
+    $conn = Invoke-WithRetry -Operation 'connexion tenant' -Action { Connect-PnPOnline @params }
+    Write-Log "Connecté au tenant pour Graph/Teams." 'OK'
+    return $conn
+}
+
+function Copy-Team {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param([Parameter(Mandatory = $true)]$Connection)
+
+    Write-Log "Clonage de l'équipe Teams source ($SourceTeamId)..." 'STEP'
+    Write-Progress -Id 1 -Activity 'Clonage Teams' -Status 'Préparation du clone' -PercentComplete 30
+
+    # Vérifie que l'équipe source existe.
+    $srcTeam = Invoke-WithRetry -Operation 'lecture équipe source' -Action {
+        Invoke-PnPGraphMethod -Url "v1.0/teams/$SourceTeamId" -Method Get -Connection $Connection
+    }
+    Write-Log "Équipe source : '$($srcTeam.displayName)'." 'OK'
+
+    # mailNickname : alias dérivé du nouveau nom (alphanumérique uniquement).
+    $alias = ($NewTeamName -replace '[^a-zA-Z0-9]', '')
+    if (-not $alias) { $alias = "team$($script:StartTime.ToString('yyyyMMddHHmmss'))" }
+
+    # ACL : les membres/owners ne sont clonés que si demandé.
+    $parts = @('apps', 'tabs', 'settings', 'channels')
+    if ($IncludePermissions) {
+        $parts += 'members'
+        Write-Log "ACL activées : membres et owners de l'équipe inclus dans le clone." 'INFO'
+    }
+    else {
+        Write-Log "ACL désactivées : seul l'appelant sera owner de la nouvelle équipe." 'INFO'
+    }
+
+    $body = @{
+        displayName  = $NewTeamName
+        mailNickname = $alias
+        partsToClone = ($parts -join ',')
+        visibility   = $Visibility
+        description  = "Clone de '$($srcTeam.displayName)' — $($script:StartTime.ToString('yyyy-MM-dd HH:mm'))"
+    }
+
+    if ($DryRun) {
+        Write-Log "[DRYRUN] Clonerait l'équipe -> '$NewTeamName' (alias '$alias', parts: $($body.partsToClone))." 'WARN'
+        return [ordered]@{ Mode = 'Team'; Source = $srcTeam.displayName; NewTeam = $NewTeamName; Parts = $body.partsToClone; Status = 'DRYRUN' }
+    }
+    if (-not $PSCmdlet.ShouldProcess($NewTeamName, "Cloner l'équipe Teams $SourceTeamId")) { return }
+
+    Write-Progress -Id 1 -Activity 'Clonage Teams' -Status 'Envoi de la demande de clone' -PercentComplete 60
+    # Le clone est asynchrone : Graph renvoie une opération (teamsAsyncOperation).
+    Invoke-WithRetry -Operation 'clone équipe' -Action {
+        Invoke-PnPGraphMethod -Url "v1.0/teams/$SourceTeamId/clone" -Method Post -Content $body -Connection $Connection
+    } | Out-Null
+
+    Write-Log "Demande de clonage envoyée (traitement asynchrone côté Microsoft 365)." 'OK'
+    Write-Log "La nouvelle équipe '$NewTeamName' apparaîtra dans Teams sous quelques minutes." 'INFO'
+
+    return [ordered]@{ Mode = 'Team'; Source = $srcTeam.displayName; NewTeam = $NewTeamName; Parts = $body.partsToClone; Status = 'Submitted' }
+}
+#endregion
+
 #region ░░ STREAM 9 : Orchestration (Main) ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 # Enchaîne les streams, gère le transcript et les erreurs globales.
 
 try {
     Start-Transcript -Path (Join-Path $LogPath ("Transcript_{0:yyyyMMdd_HHmmss}.log" -f $script:StartTime)) -Force | Out-Null
 
-    Write-Log "=== Démarrage de la duplication SharePoint ===" 'STEP'
-    Write-Log ("Source: {0} | Cible: {1} | DryRun: {2}" -f $SourceUrl, $TargetUrl, $DryRun) 'INFO'
-
+    Write-Log "=== Démarrage — mode $($PSCmdlet.ParameterSetName) | DryRun: $DryRun | ACL: $IncludePermissions ===" 'STEP'
     Initialize-Prerequisites
 
-    $sourceConn = Connect-Site -Url $SourceUrl -Label 'site source'
-    Export-SourceTemplate -Connection $sourceConn
+    if ($PSCmdlet.ParameterSetName -eq 'Team') {
+        # --- Mode TEAM : clonage d'une équipe Microsoft Teams via Graph ---
+        $tenantConn = Connect-Tenant -Url $TenantUrl
+        $teamResult = Copy-Team -Connection $tenantConn
 
-    New-TargetSite
-    $targetConn = Invoke-TargetTemplate
-
-    $copyStats = $null
-    if ($targetConn -and -not $DryRun) {
-        $copyStats = Copy-LibrariesContent -SourceConn $sourceConn -TargetConn $targetConn
+        Write-Host ""
+        $bar = '═' * 64
+        Write-Host $bar -ForegroundColor Cyan
+        Write-Host "  RAPPORT DE CLONAGE TEAMS" -ForegroundColor Cyan
+        Write-Host $bar -ForegroundColor Cyan
+        if ($teamResult) {
+            Write-Host ("  Équipe source : {0}" -f $teamResult.Source)
+            Write-Host ("  Nouvelle      : {0}" -f $teamResult.NewTeam)
+            Write-Host ("  Éléments      : {0}" -f $teamResult.Parts)
+            Write-Host ("  Statut        : {0}" -f $teamResult.Status)
+        }
+        Write-Host ("  ACL (membres) : {0}" -f $(if ($IncludePermissions) { 'Copiées' } else { 'Non copiées' }))
+        Write-Host ("  Log           : {0}" -f $script:LogFile)
+        Write-Host $bar -ForegroundColor Cyan
+        Write-Host ""
+        Write-Progress -Id 1 -Activity 'Clonage Teams' -Completed
     }
-    elseif ($DryRun) {
-        $copyStats = Copy-LibrariesContent -SourceConn $sourceConn -TargetConn $sourceConn
+    else {
+        # --- Mode SITE : duplication d'un site SharePoint ---
+        Write-Log ("Source: {0} | Cible: {1}" -f $SourceUrl, $TargetUrl) 'INFO'
+
+        $sourceConn = Connect-Site -Url $SourceUrl -Label 'site source'
+        Export-SourceTemplate -Connection $sourceConn
+
+        New-TargetSite
+        $targetConn = Invoke-TargetTemplate
+
+        $copyStats = $null
+        if ($targetConn -and -not $DryRun) {
+            $copyStats = Copy-LibrariesContent -SourceConn $sourceConn -TargetConn $targetConn
+        }
+        elseif ($DryRun) {
+            $copyStats = Copy-LibrariesContent -SourceConn $sourceConn -TargetConn $sourceConn
+        }
+
+        Write-FinalReport -SourceConn $sourceConn -TargetConn $targetConn -CopyStats $copyStats
     }
 
-    Write-FinalReport -SourceConn $sourceConn -TargetConn $targetConn -CopyStats $copyStats
-    Write-Log "=== Duplication terminée avec succès ===" 'OK'
+    Write-Log "=== Terminé avec succès ===" 'OK'
     exit 0
 }
 catch {
