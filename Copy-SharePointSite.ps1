@@ -130,8 +130,19 @@ function Write-Log {
     }
 }
 
+function Test-TransientError {
+    # Vrai uniquement pour les erreurs rejouables (throttling / indispo / timeout réseau).
+    param([Parameter(Mandatory = $true)]$ErrorRecord)
+    $msg    = $ErrorRecord.Exception.Message
+    $status = $null
+    try { $status = [int]$ErrorRecord.Exception.Response.StatusCode } catch {}
+    if ($status -in 429, 500, 502, 503, 504) { return $true }
+    return ($msg -match '(?i)throttl|too many requests|temporarily|timed?\s*out|service unavailable|connection (was )?(reset|closed)|operation has timed out')
+}
+
 function Invoke-WithRetry {
-    # Exécute un scriptblock avec retry + back-off exponentiel (throttling SPO 429, transitoires).
+    # Exécute un scriptblock avec retry + back-off exponentiel, UNIQUEMENT sur erreurs transitoires.
+    # Une erreur définitive (404, auth, paramètre invalide) est relancée immédiatement.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][scriptblock]$Action,
@@ -144,12 +155,17 @@ function Invoke-WithRetry {
             return & $Action
         }
         catch {
+            $isTransient = Test-TransientError -ErrorRecord $_
+            if (-not $isTransient) {
+                Write-Log "Échec non transitoire de '$Operation' : $($_.Exception.Message)" 'ERROR'
+                throw
+            }
             if ($attempt -eq $MaxAttempts) {
                 Write-Log "Échec définitif de '$Operation' après $MaxAttempts tentatives : $($_.Exception.Message)" 'ERROR'
                 throw
             }
             $delay = $BaseDelaySec * [math]::Pow(2, $attempt - 1)
-            Write-Log "Échec de '$Operation' (tentative $attempt/$MaxAttempts) : $($_.Exception.Message). Nouvel essai dans ${delay}s." 'WARN'
+            Write-Log "Erreur transitoire sur '$Operation' (tentative $attempt/$MaxAttempts) : $($_.Exception.Message). Nouvel essai dans ${delay}s." 'WARN'
             Start-Sleep -Seconds $delay
         }
     }
@@ -266,10 +282,12 @@ function New-TargetSite {
         return
     }
 
-    $siteParams = @{ Url = $TargetUrl; Title = $TargetTitle; Connection = $adminConn; ErrorAction = 'Stop' }
+    # NB : seul CommunicationSite accepte -Url ; TeamSite dérive son URL de -Alias.
+    $siteParams = @{ Title = $TargetTitle; Connection = $adminConn; ErrorAction = 'Stop' }
     switch ($TargetType) {
         'CommunicationSite' {
             $siteParams['Type'] = 'CommunicationSite'
+            $siteParams['Url']  = $TargetUrl
             if ($Owner) { $siteParams['Owner'] = $Owner }
         }
         'TeamSite' {
@@ -280,8 +298,19 @@ function New-TargetSite {
     }
 
     Invoke-WithRetry -Operation 'création du site' -Action { New-PnPSite @siteParams } | Out-Null
-    Write-Log "Site cible créé. Attente de la propagation (15s)..." 'OK'
-    Start-Sleep -Seconds 15
+    Write-Log "Site cible créé. Attente de la propagation (statut Active)..." 'OK'
+
+    # Polling du statut plutôt qu'un sleep fixe : on attend que le site soit réellement provisionné.
+    $deadline = (Get-Date).AddMinutes(5)
+    do {
+        Start-Sleep -Seconds 5
+        $site = $null
+        try { $site = Get-PnPTenantSite -Url $TargetUrl -Connection $adminConn -ErrorAction SilentlyContinue } catch {}
+        $status = if ($site) { "$($site.Status)" } else { 'Provisioning' }
+    } while ($status -ne 'Active' -and (Get-Date) -lt $deadline)
+
+    if ($status -eq 'Active') { Write-Log "Site cible actif." 'OK' }
+    else { Write-Log "Délai d'attente dépassé (statut: $status). L'application du modèle peut échouer." 'WARN' }
 }
 #endregion
 
@@ -338,36 +367,50 @@ function Copy-LibrariesContent {
             Get-PnPListItem -List $lib -PageSize 500 -Connection $SourceConn -Fields 'FileLeafRef', 'FileRef', 'FSObjType'
         }
 
-        $n = 0; $total = [math]::Max($items.Count, 1)
-        foreach ($item in $items) {
+        # Préfixe de chemin (web) décodé : FileRef est non-échappé, AbsolutePath est échappé.
+        $srcWebPath = [uri]::UnescapeDataString(([uri]$SourceUrl).AbsolutePath)
+
+        # Dossiers d'abord, puis par profondeur croissante : la structure existe avant les fichiers.
+        $ordered = $items | Sort-Object `
+            @{ Expression = { if ($_['FSObjType'] -eq 1) { 0 } else { 1 } } }, `
+            @{ Expression = { "$($_['FileRef'])".Split('/').Count } }
+
+        $n = 0; $total = [math]::Max($ordered.Count, 1)
+        foreach ($item in $ordered) {
             $n++
             $serverRel = $item['FileRef']
             $isFolder  = ($item['FSObjType'] -eq 1)
-            $leaf      = $item['FileLeafRef']
+            $leaf       = $item['FileLeafRef']
             Write-Progress -Id 2 -ParentId 1 -Activity "Bibliothèque '$($lib.Title)'" `
                 -Status "$n/$total : $leaf" -PercentComplete (($n / $total) * 100)
 
-            # Chemin relatif au site, réécrit vers l'URL du site cible.
-            $relToWeb   = $serverRel.Substring(([uri]$SourceUrl).AbsolutePath.Length).TrimStart('/')
-            $targetPath = (([uri]$TargetUrl).AbsolutePath.TrimEnd('/')) + '/' + $relToWeb
-            $targetDir  = $targetPath.Substring(0, $targetPath.LastIndexOf('/'))
+            # Chemin relatif au web (sans le préfixe du site source), puis dossier parent côté cible.
+            $relToWeb     = $serverRel.Substring($srcWebPath.Length).TrimStart('/')
+            $parentRelDir = if ($relToWeb.Contains('/')) { $relToWeb.Substring(0, $relToWeb.LastIndexOf('/')) } else { '' }
 
             if ($DryRun) {
-                Write-Log "[DRYRUN] Copierait : $serverRel -> $targetPath" 'DEBUG'
+                Write-Log "[DRYRUN] Copierait : $serverRel -> <cible>/$relToWeb" 'DEBUG'
                 if ($isFolder) { $stats.Folders++ } else { $stats.Files++ }
                 continue
             }
 
             try {
                 if ($isFolder) {
-                    Resolve-PnPFolder -SiteRelativePath ($targetDir.Substring(([uri]$TargetUrl).AbsolutePath.Length).TrimStart('/')) `
-                        -Connection $TargetConn -ErrorAction Stop | Out-Null
+                    # Crée l'arborescence (site-relative) côté cible.
+                    Resolve-PnPFolder -SiteRelativePath $relToWeb -Connection $TargetConn -ErrorAction Stop | Out-Null
                     $stats.Folders++
                 }
                 else {
+                    # 1) Garantir le dossier parent côté cible (supprime toute dépendance d'ordre).
+                    if ($parentRelDir) {
+                        Resolve-PnPFolder -SiteRelativePath $parentRelDir -Connection $TargetConn -ErrorAction Stop | Out-Null
+                    }
+                    # 2) Copie cross-site fiable : download (source) -> upload (cible).
+                    #    Évite la limite same-site-collection de Copy-PnPFile.
                     Invoke-WithRetry -Operation "copie '$leaf'" -Action {
-                        Copy-PnPFile -SourceUrl $serverRel -TargetUrl $targetDir `
-                            -Force -OverwriteIfAlreadyExists -Connection $SourceConn -ErrorAction Stop
+                        $stream = Get-PnPFile -Url $serverRel -AsMemoryStream -Connection $SourceConn -ErrorAction Stop
+                        Add-PnPFile -FileName $leaf -Folder $parentRelDir -Stream $stream `
+                            -Connection $TargetConn -ErrorAction Stop | Out-Null
                     } | Out-Null
                     $stats.Files++
                 }
