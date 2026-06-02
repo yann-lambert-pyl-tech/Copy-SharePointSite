@@ -1,4 +1,4 @@
-Mode,SourceUrl,TargetUrl,TargetTitle,TargetType,Owner,IncludeContent,SourceTeamId,NewTeamName,TenantUrl,Visibility,IncludePermissions,DryRun
+﻿Mode,SourceUrl,TargetUrl,TargetTitle,TargetType,Owner,IncludeContent,SourceTeamId,NewTeamName,TenantUrl,Visibility,IncludePermissions,DryRun
 Site,https://contoso.sharepoint.com/sites/Modele,https://contoso.sharepoint.com/sites/Modele-Copie,Modèle (copie),CommunicationSite,admin@contoso.com,true,,,,,true,false
 Site,https://contoso.sharepoint.com/sites/RH,https://contoso.sharepoint.com/sites/RH-Archive,RH Archive,TeamSite,admin@contoso.com,false,,,,,false,false
 Team,,,,,,,0a1b2c3d-4e5f-6789-abcd-ef0123456789,Projet Alpha (copie),https://contoso.sharepoint.com,Private,true,false

@@ -21,7 +21,7 @@ Code organisé en **streams** (`#region`), chaque bloc autonome et commenté, av
 
 ## 📋 Pré-requis
 
-- PowerShell **5.1+** (ou PowerShell 7+)
+- PowerShell **7.2+** (requis par PnP.PowerShell ; Windows PowerShell 5.1 n'est pas supporté)
 - Module **PnP.PowerShell**
   ```powershell
   Install-Module PnP.PowerShell -Scope CurrentUser
