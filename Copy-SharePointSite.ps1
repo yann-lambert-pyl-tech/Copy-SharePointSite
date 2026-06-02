@@ -92,6 +92,11 @@
     -Tenant lors de l'auth par certificat. À renseigner quand le préfixe SharePoint
     diffère du domaine du tenant (déduction impossible depuis l'URL).
 
+.PARAMETER ManualBuild
+    (Mode TEAM) Construction SYNCHRONE sans clone asynchrone : crée l'équipe via
+    New-PnPTeamsTeam, recrée les canaux standard de la source, puis copie le contenu.
+    Requiert -Owner. Les onglets / apps / conversations ne sont PAS repris (clone only).
+
 .PARAMETER ForceContentCopy
     (Mode TEAM) Après le clone, copie SYNCHRONE et forcée du contenu des bibliothèques
     SharePoint (site source -> site de la nouvelle équipe), avec progression. Garantit
@@ -141,6 +146,12 @@
     .\Copy-SharePointSite.ps1 -SourceTeamId 0a1b2c3d-4e5f-6789-abcd-ef0123456789 `
         -NewTeamName "Projet Alpha (copie)" -TenantUrl https://contoso.sharepoint.com `
         -Owner chef.projet@contoso.com -ForceContentCopy -MuteNotifications -IncludePermissions
+
+.EXAMPLE
+    # Teams : construction 100% SYNCHRONE (sans clone async) — équipe + canaux + fichiers
+    .\Copy-SharePointSite.ps1 -SourceTeamId 0a1b2c3d-4e5f-6789-abcd-ef0123456789 `
+        -NewTeamName "Projet Alpha (copie)" -TenantUrl https://contoso.sharepoint.com `
+        -Owner chef.projet@contoso.com -ManualBuild -MuteNotifications
 
 .NOTES
     Auteur  : Pyl.Tech
@@ -203,6 +214,12 @@ param(
     # ACL : copie des permissions (groupes/rôles du site, ou membres/owners de l'équipe).
     [Parameter(Mandatory = $false)]
     [switch]$IncludePermissions,
+
+    # Mode TEAM : construction SYNCHRONE (sans clone async). Crée l'équipe via
+    # New-PnPTeamsTeam, recrée les canaux, puis copie le contenu. N'utilise PAS
+    # l'API clone (asynchrone). Onglets/apps/conversations NON repris (clone only).
+    [Parameter(Mandatory = $false)]
+    [switch]$ManualBuild,
 
     # Mode TEAM : copie SYNCHRONE et forcée du contenu SharePoint après le clone
     # (ne dépend pas de l'asynchrone Graph pour les fichiers).
@@ -863,13 +880,54 @@ function Copy-Team {
         Write-Log "Propriétaire '$Owner' : sera attribué à la nouvelle équipe après le clone." 'INFO'
     }
 
-    # ACL : les membres/owners ne sont clonés que si demandé.
+    # Vérification ACL : on remonte en INFO les identités détectées côté source.
+    if ($IncludePermissions) { Write-DetectedTeamAcl -TeamId $SourceTeamId -Connection $Connection }
+
+    # ───────── MODE MANUEL : construction SYNCHRONE (aucun clone async) ─────────
+    if ($ManualBuild) {
+        # En app-only (certificat), la création de groupe EXIGE un owner utilisateur.
+        if (-not $Owner) { throw "-ManualBuild requiert -Owner (l'app-only ne peut pas être propriétaire du groupe)." }
+
+        if ($DryRun) {
+            Write-Log "[DRYRUN] Construirait l'équipe '$NewTeamName' (alias '$alias') + recréation des canaux source, SANS clone async." 'WARN'
+            return [ordered]@{ Mode = 'Team'; Source = $srcTeam.displayName; NewTeam = $NewTeamName; Alias = $alias; Parts = 'manuel: équipe + canaux + contenu'; Status = 'DRYRUN'; GroupId = $null }
+        }
+        if (-not $PSCmdlet.ShouldProcess($NewTeamName, "Construire l'équipe (synchrone, sans clone)")) { return }
+
+        Write-Log "Construction MANUELLE synchrone de l'équipe (sans clone)..." 'STEP'
+        $team = Invoke-WithRetry -Operation 'création équipe' -Action {
+            New-PnPTeamsTeam -DisplayName $NewTeamName -MailNickname $alias -Description "Copie de '$($srcTeam.displayName)'" -Visibility $Visibility -Owners $Owner -Connection $Connection
+        }
+        $groupId = $team.GroupId
+        Write-Log "Équipe créée (synchrone) : '$NewTeamName' (GroupId $groupId)." 'OK'
+
+        # Recréer les canaux standard de la source (hors General/Général ; privés ignorés).
+        $srcChannels = Invoke-WithRetry -Operation 'lecture canaux source' -Action {
+            Invoke-PnPGraphMethod -Url "v1.0/teams/$SourceTeamId/channels?`$select=displayName,description,membershipType" -Method Get -Connection $Connection
+        }
+        $created = 0
+        foreach ($ch in @($srcChannels.value)) {
+            if ($ch.displayName -in 'General', 'Général') { continue }
+            if ($ch.membershipType -eq 'private') {
+                Write-Log "Canal privé ignoré : '$($ch.displayName)' (à recréer manuellement)." 'WARN'
+                continue
+            }
+            try {
+                Add-PnPTeamsChannel -Team $groupId -DisplayName $ch.displayName -Description ([string]$ch.description) -Connection $Connection -ErrorAction Stop | Out-Null
+                $created++
+                Write-Log "Canal recréé : '$($ch.displayName)'." 'OK'
+            }
+            catch { Write-Log "Canal '$($ch.displayName)' non recréé : $($_.Exception.Message)" 'WARN' }
+        }
+        Write-Log "Canaux recréés : $created (onglets/apps/conversations NON repris en mode manuel)." 'OK'
+        return [ordered]@{ Mode = 'Team'; Source = $srcTeam.displayName; NewTeam = $NewTeamName; Alias = $alias; Parts = "manuel: $created canal(aux) + contenu"; Status = 'Created'; GroupId = $groupId }
+    }
+
+    # ───────── MODE CLONE : asynchrone (Graph clone team) ─────────
     $parts = @('apps', 'tabs', 'settings', 'channels')
     if ($IncludePermissions) {
         $parts += 'members'
         Write-Log "ACL activées : membres et owners de l'équipe inclus dans le clone." 'INFO'
-        # Vérification : on remonte en INFO les identités détectées côté source.
-        Write-DetectedTeamAcl -TeamId $SourceTeamId -Connection $Connection
     }
     else {
         Write-Log "ACL désactivées : seul l'appelant sera owner de la nouvelle équipe." 'INFO'
@@ -885,7 +943,7 @@ function Copy-Team {
 
     if ($DryRun) {
         Write-Log "[DRYRUN] Clonerait l'équipe -> '$NewTeamName' (alias '$alias', parts: $($body.partsToClone))." 'WARN'
-        return [ordered]@{ Mode = 'Team'; Source = $srcTeam.displayName; NewTeam = $NewTeamName; Alias = $alias; Parts = $body.partsToClone; Status = 'DRYRUN' }
+        return [ordered]@{ Mode = 'Team'; Source = $srcTeam.displayName; NewTeam = $NewTeamName; Alias = $alias; Parts = $body.partsToClone; Status = 'DRYRUN'; GroupId = $null }
     }
     if (-not $PSCmdlet.ShouldProcess($NewTeamName, "Cloner l'équipe Teams $SourceTeamId")) { return }
 
@@ -896,7 +954,7 @@ function Copy-Team {
 
     Write-Log "Demande de clonage envoyée (traitement asynchrone côté Microsoft 365)." 'OK'
 
-    return [ordered]@{ Mode = 'Team'; Source = $srcTeam.displayName; NewTeam = $NewTeamName; Alias = $alias; Parts = $body.partsToClone; Status = 'Submitted' }
+    return [ordered]@{ Mode = 'Team'; Source = $srcTeam.displayName; NewTeam = $NewTeamName; Alias = $alias; Parts = $body.partsToClone; Status = 'Submitted'; GroupId = $null }
 }
 
 function Wait-ClonedGroup {
@@ -1118,11 +1176,18 @@ function Invoke-CopyOperation {
             $tenantConn = Invoke-Step 2 { Connect-Tenant -Url $TenantUrl }
             $teamResult = Invoke-Step 3 { Copy-Team -Connection $tenantConn }
 
-            # Si owner et/ou copie forcée : on attend que l'équipe clonée soit disponible.
-            $newGroup = $null
-            $needGroup = ($Owner -or $ForceContentCopy) -and -not $DryRun -and $teamResult -and $teamResult.Status -eq 'Submitted'
-            if ($needGroup) {
-                $newGroup = Wait-ClonedGroup -Alias $teamResult.Alias -Connection $tenantConn
+            # Résolution du groupe cible : direct en mode manuel (GroupId connu),
+            # sinon attente du clone asynchrone. La copie de contenu est implicite en manuel.
+            $newGroup    = $null
+            $wantContent = $ForceContentCopy -or $ManualBuild
+            $teamOk      = $teamResult -and ($teamResult.Status -in 'Submitted', 'Created')
+            if (-not $DryRun -and $teamOk -and ($Owner -or $wantContent)) {
+                if ($teamResult.GroupId) {
+                    $newGroup = [pscustomobject]@{ id = $teamResult.GroupId; displayName = $NewTeamName }
+                }
+                else {
+                    $newGroup = Wait-ClonedGroup -Alias $teamResult.Alias -Connection $tenantConn
+                }
             }
 
             # Étape 4 : attribuer le propriétaire (owner + membre).
@@ -1130,17 +1195,17 @@ function Invoke-CopyOperation {
                 Invoke-Step 4 { Set-GroupOwner -GroupId $newGroup.id -OwnerUpn $Owner -Connection $tenantConn -Mute:$MuteNotifications }
             }
             else {
-                Set-StepSkipped 4 $(if (-not $Owner) { 'aucun -Owner spécifié' } elseif ($DryRun) { 'DryRun' } else { 'clone non soumis' })
+                Set-StepSkipped 4 $(if (-not $Owner) { 'aucun -Owner spécifié' } elseif ($DryRun) { 'DryRun' } else { 'équipe indisponible' })
             }
 
-            # Étape 5 : copie forcée et synchrone du contenu SharePoint.
+            # Étape 5 : copie synchrone du contenu SharePoint (forcée, ou implicite en manuel).
             $teamCopyStats = $null
-            if ($ForceContentCopy -and $newGroup) {
+            if ($wantContent -and $newGroup) {
                 $teamCopyStats = Invoke-Step 5 { Copy-TeamContent -SourceTeamId $SourceTeamId -NewGroupId $newGroup.id -Connection $tenantConn }
                 if ($teamCopyStats) { $result.Files = $teamCopyStats.Files; $result.Errors = $teamCopyStats.Errors }
             }
             else {
-                Set-StepSkipped 5 $(if (-not $ForceContentCopy) { '-ForceContentCopy non demandé' } elseif ($DryRun) { 'DryRun' } else { 'clone non soumis' })
+                Set-StepSkipped 5 $(if (-not $wantContent) { '-ForceContentCopy / -ManualBuild non demandé' } elseif ($DryRun) { 'DryRun' } else { 'équipe indisponible' })
             }
 
             Show-StepChecklist
