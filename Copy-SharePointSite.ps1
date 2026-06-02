@@ -225,6 +225,137 @@ function Invoke-WithRetry {
 }
 #endregion
 
+#region ░░ STREAM 1bis : Interface de suivi (UI) ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+# Suivi d'exécution pour l'administrateur :
+#   - Bannière de démarrage (paramètres de la session)
+#   - Liste d'étapes pilotée (Pending/Running/Done/Failed/Skipped) + durée par étape
+#   - Barre de progression globale auto-calculée (Write-Progress, Id 1)
+#   - Checklist finale récapitulative
+# Le tracker est la SEULE source de la barre Id 1 ; les fonctions métier ne
+# pilotent que les barres imbriquées (Id 2).
+
+$script:Steps            = [System.Collections.Generic.List[object]]::new()
+$script:CurrentStepIndex = 0
+$script:ActivityName     = 'Exécution'
+
+function Write-Banner {
+    # Affiche un en-tête lisible avec le contexte de la session.
+    param([Parameter(Mandatory = $true)][string]$Title, [hashtable]$Fields)
+    $bar = '═' * 64
+    Write-Host ""
+    Write-Host $bar -ForegroundColor Cyan
+    Write-Host ("  {0}" -f $Title) -ForegroundColor Cyan
+    Write-Host $bar -ForegroundColor Cyan
+    if ($Fields) {
+        foreach ($k in $Fields.Keys) {
+            Write-Host ("  {0,-16}: {1}" -f $k, $Fields[$k]) -ForegroundColor Gray
+        }
+        Write-Host $bar -ForegroundColor Cyan
+    }
+    Write-Host ""
+}
+
+function Initialize-StepTracker {
+    # Déclare la liste ordonnée des étapes à suivre pour la session courante.
+    param(
+        [Parameter(Mandatory = $true)][string[]]$StepLabels,
+        [string]$Activity = 'Exécution'
+    )
+    $script:Steps.Clear()
+    $script:ActivityName = $Activity
+    $i = 0
+    foreach ($label in $StepLabels) {
+        $i++
+        $script:Steps.Add([pscustomobject]@{
+            Index  = $i
+            Label  = $label
+            Status = 'Pending'
+            Start  = $null
+            End    = $null
+        })
+    }
+    $script:CurrentStepIndex = 0
+    Update-ProgressUI
+}
+
+function Update-ProgressUI {
+    # Recalcule et rafraîchit la barre de progression globale (Id 1).
+    $total = $script:Steps.Count
+    if ($total -eq 0) { return }
+    $finished = ($script:Steps | Where-Object { $_.Status -in 'Done', 'Skipped', 'Failed' }).Count
+    $pct      = [int](($finished / $total) * 100)
+    $curLabel = if ($script:CurrentStepIndex -ge 1) { $script:Steps[$script:CurrentStepIndex - 1].Label } else { 'Initialisation' }
+    $elapsed  = (Get-Date) - $script:StartTime
+    Write-Progress -Id 1 -Activity $script:ActivityName `
+        -Status ("Étape {0}/{1} : {2}  —  écoulé {3:mm\:ss}" -f $script:CurrentStepIndex, $total, $curLabel, $elapsed) `
+        -PercentComplete $pct
+}
+
+function Invoke-Step {
+    # Exécute une étape : marque Running, journalise, chronomètre, marque Done/Failed,
+    # met à jour la barre, et renvoie le résultat du scriptblock à l'appelant.
+    param(
+        [Parameter(Mandatory = $true)][int]$Index,
+        [Parameter(Mandatory = $true)][scriptblock]$Action,
+        [switch]$ContinueOnError
+    )
+    $step = $script:Steps[$Index - 1]
+    $script:CurrentStepIndex = $Index
+    $step.Status = 'Running'
+    $step.Start  = Get-Date
+    Update-ProgressUI
+    Write-Log ("Étape {0}/{1} ▶ {2}" -f $Index, $script:Steps.Count, $step.Label) 'STEP'
+
+    try {
+        $result = & $Action
+        $step.Status = 'Done'
+        $step.End    = Get-Date
+        Write-Log ("Étape {0}/{1} ✓ {2} ({3:n1}s)" -f $Index, $script:Steps.Count, $step.Label, ($step.End - $step.Start).TotalSeconds) 'OK'
+        Update-ProgressUI
+        return $result
+    }
+    catch {
+        $step.Status = 'Failed'
+        $step.End    = Get-Date
+        Write-Log ("Étape {0}/{1} ✗ {2} : {3}" -f $Index, $script:Steps.Count, $step.Label, $_.Exception.Message) 'ERROR'
+        Update-ProgressUI
+        if ($ContinueOnError) { return $null }
+        throw
+    }
+}
+
+function Set-StepSkipped {
+    # Marque une étape comme volontairement sautée (ex. mode DryRun).
+    param([Parameter(Mandatory = $true)][int]$Index, [string]$Reason)
+    $step = $script:Steps[$Index - 1]
+    $step.Status = 'Skipped'
+    Write-Log ("Étape {0}/{1} ⊘ {2}{3}" -f $Index, $script:Steps.Count, $step.Label, $(if ($Reason) { " ($Reason)" } else { '' })) 'WARN'
+    Update-ProgressUI
+}
+
+function Show-StepChecklist {
+    # Imprime la checklist finale : icône d'état + libellé + durée par étape.
+    if ($script:Steps.Count -eq 0) { return }
+    Write-Progress -Id 1 -Activity $script:ActivityName -Completed
+    $bar = '─' * 64
+    Write-Host ""
+    Write-Host "  SUIVI D'EXÉCUTION (étapes)" -ForegroundColor Cyan
+    Write-Host $bar -ForegroundColor DarkGray
+    foreach ($s in $script:Steps) {
+        $icon, $color = switch ($s.Status) {
+            'Done'    { '✓', 'Green' }
+            'Failed'  { '✗', 'Red' }
+            'Skipped' { '⊘', 'Yellow' }
+            'Running' { '▶', 'Cyan' }
+            default   { '·', 'DarkGray' }
+        }
+        $dur = if ($s.Start -and $s.End) { "{0,6:n1}s" -f ($s.End - $s.Start).TotalSeconds } else { '       ' }
+        Write-Host ("   {0}  {1,-2} {2,-44} {3}" -f $icon, $s.Index, $s.Label, $dur) -ForegroundColor $color
+    }
+    Write-Host $bar -ForegroundColor DarkGray
+}
+#endregion
+
 #region ░░ STREAM 2 : Pré-requis ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 # Vérifie / importe le module PnP.PowerShell. Le reste du script en dépend.
 
@@ -280,7 +411,6 @@ function Export-SourceTemplate {
     param([Parameter(Mandatory = $true)]$Connection)
 
     Write-Log "Extraction du modèle PnP du site source..." 'STEP'
-    Write-Progress -Id 1 -Activity 'Duplication SharePoint' -Status 'Extraction du modèle source' -PercentComplete 20
 
     # ACL : on n'inclut le handler SiteSecurity (groupes, rôles, attributions) que si demandé.
     $handlerList = [System.Collections.Generic.List[string]]@(
@@ -323,7 +453,6 @@ function Export-SourceTemplate {
 
 function New-TargetSite {
     Write-Log "Provisioning du site cible ($TargetType) : $TargetUrl" 'STEP'
-    Write-Progress -Id 1 -Activity 'Duplication SharePoint' -Status 'Création du site cible' -PercentComplete 45
 
     if (-not $TargetTitle) {
         $TargetTitle = ($TargetUrl.TrimEnd('/').Split('/')[-1]) -replace '%20', ' '
@@ -384,7 +513,6 @@ function New-TargetSite {
 
 function Invoke-TargetTemplate {
     Write-Log "Application du modèle sur le site cible..." 'STEP'
-    Write-Progress -Id 1 -Activity 'Duplication SharePoint' -Status 'Application du modèle' -PercentComplete 65
 
     if ($DryRun) {
         Write-Log "[DRYRUN] Modèle NON appliqué (simulation)." 'WARN'
@@ -416,7 +544,6 @@ function Copy-LibrariesContent {
         [Parameter(Mandatory = $true)]$TargetConn
     )
     Write-Log "Copie du contenu des bibliothèques de documents..." 'STEP'
-    Write-Progress -Id 1 -Activity 'Duplication SharePoint' -Status 'Copie des fichiers' -PercentComplete 80
 
     # Bibliothèques de documents non masquées (BaseTemplate 101).
     $libs = Get-PnPList -Connection $SourceConn |
@@ -502,7 +629,6 @@ function Write-FinalReport {
     param($SourceConn, $TargetConn, $CopyStats)
 
     Write-Log "Vérification post-copie..." 'STEP'
-    Write-Progress -Id 1 -Activity 'Duplication SharePoint' -Status 'Vérification' -PercentComplete 95
 
     $duration = (Get-Date) - $script:StartTime
     $line = '═' * 64
@@ -536,8 +662,6 @@ function Write-FinalReport {
     Write-Host ("  Modèle        : {0}" -f $script:TemplateFile)
     Write-Host $line -ForegroundColor Cyan
     Write-Host ""
-
-    Write-Progress -Id 1 -Activity 'Duplication SharePoint' -Completed
 }
 #endregion
 
@@ -564,7 +688,6 @@ function Copy-Team {
     param([Parameter(Mandatory = $true)]$Connection)
 
     Write-Log "Clonage de l'équipe Teams source ($SourceTeamId)..." 'STEP'
-    Write-Progress -Id 1 -Activity 'Clonage Teams' -Status 'Préparation du clone' -PercentComplete 30
 
     # Vérifie que l'équipe source existe.
     $srcTeam = Invoke-WithRetry -Operation 'lecture équipe source' -Action {
@@ -600,7 +723,6 @@ function Copy-Team {
     }
     if (-not $PSCmdlet.ShouldProcess($NewTeamName, "Cloner l'équipe Teams $SourceTeamId")) { return }
 
-    Write-Progress -Id 1 -Activity 'Clonage Teams' -Status 'Envoi de la demande de clone' -PercentComplete 60
     # Le clone est asynchrone : Graph renvoie une opération (teamsAsyncOperation).
     Invoke-WithRetry -Operation 'clone équipe' -Action {
         Invoke-PnPGraphMethod -Url "v1.0/teams/$SourceTeamId/clone" -Method Post -Content $body -Connection $Connection
@@ -619,50 +741,79 @@ function Copy-Team {
 try {
     Start-Transcript -Path (Join-Path $LogPath ("Transcript_{0:yyyyMMdd_HHmmss}.log" -f $script:StartTime)) -Force | Out-Null
 
-    Write-Log "=== Démarrage — mode $($PSCmdlet.ParameterSetName) | DryRun: $DryRun | ACL: $IncludePermissions ===" 'STEP'
-    Initialize-Prerequisites
+    $mode = $PSCmdlet.ParameterSetName
+    $aclLabel = if ($IncludePermissions) { 'Copiées' } else { 'Non copiées' }
 
-    if ($PSCmdlet.ParameterSetName -eq 'Team') {
-        # --- Mode TEAM : clonage d'une équipe Microsoft Teams via Graph ---
-        $tenantConn = Connect-Tenant -Url $TenantUrl
-        $teamResult = Copy-Team -Connection $tenantConn
+    if ($mode -eq 'Team') {
+        # ---------- MODE TEAM : clonage d'une équipe Microsoft Teams ----------
+        Write-Banner -Title "CLONAGE MICROSOFT TEAMS" -Fields ([ordered]@{
+            'Équipe source' = $SourceTeamId
+            'Nouvelle'      = $NewTeamName
+            'Tenant'        = $TenantUrl
+            'Visibilité'    = $Visibility
+            'ACL (membres)' = $aclLabel
+            'Mode'          = $(if ($DryRun) { 'DRYRUN (simulation)' } else { 'Réel' })
+            'Log'           = $script:LogFile
+        })
+        Initialize-StepTracker -Activity 'Clonage Teams' -StepLabels @(
+            'Pré-requis (module PnP)',
+            'Connexion tenant (Graph)',
+            'Clonage de l''équipe'
+        )
 
-        Write-Host ""
-        $bar = '═' * 64
-        Write-Host $bar -ForegroundColor Cyan
-        Write-Host "  RAPPORT DE CLONAGE TEAMS" -ForegroundColor Cyan
-        Write-Host $bar -ForegroundColor Cyan
-        if ($teamResult) {
-            Write-Host ("  Équipe source : {0}" -f $teamResult.Source)
-            Write-Host ("  Nouvelle      : {0}" -f $teamResult.NewTeam)
-            Write-Host ("  Éléments      : {0}" -f $teamResult.Parts)
-            Write-Host ("  Statut        : {0}" -f $teamResult.Status)
-        }
-        Write-Host ("  ACL (membres) : {0}" -f $(if ($IncludePermissions) { 'Copiées' } else { 'Non copiées' }))
-        Write-Host ("  Log           : {0}" -f $script:LogFile)
-        Write-Host $bar -ForegroundColor Cyan
-        Write-Host ""
-        Write-Progress -Id 1 -Activity 'Clonage Teams' -Completed
+        Invoke-Step 1 { Initialize-Prerequisites }
+        $tenantConn = Invoke-Step 2 { Connect-Tenant -Url $TenantUrl }
+        $teamResult = Invoke-Step 3 { Copy-Team -Connection $tenantConn }
+
+        Show-StepChecklist
+        Write-Banner -Title "RAPPORT DE CLONAGE TEAMS" -Fields ([ordered]@{
+            'Équipe source' = $(if ($teamResult) { $teamResult.Source } else { '-' })
+            'Nouvelle'      = $NewTeamName
+            'Éléments'      = $(if ($teamResult) { $teamResult.Parts } else { '-' })
+            'Statut'        = $(if ($teamResult) { $teamResult.Status } else { '-' })
+            'ACL (membres)' = $aclLabel
+        })
     }
     else {
-        # --- Mode SITE : duplication d'un site SharePoint ---
-        Write-Log ("Source: {0} | Cible: {1}" -f $SourceUrl, $TargetUrl) 'INFO'
+        # ---------- MODE SITE : duplication d'un site SharePoint ----------
+        Write-Banner -Title "DUPLICATION DE SITE SHAREPOINT" -Fields ([ordered]@{
+            'Source'      = $SourceUrl
+            'Cible'       = $TargetUrl
+            'Type'        = $TargetType
+            'Contenu'     = $(if ($IncludeContent) { 'Inclus' } else { 'Structure seule' })
+            'ACL'         = $aclLabel
+            'Mode'        = $(if ($DryRun) { 'DRYRUN (simulation)' } else { 'Réel' })
+            'Log'         = $script:LogFile
+        })
+        Initialize-StepTracker -Activity 'Duplication SharePoint' -StepLabels @(
+            'Pré-requis (module PnP)',
+            'Connexion au site source',
+            'Extraction du modèle',
+            'Provisioning du site cible',
+            'Application du modèle',
+            'Copie du contenu',
+            'Vérification & rapport'
+        )
 
-        $sourceConn = Connect-Site -Url $SourceUrl -Label 'site source'
-        Export-SourceTemplate -Connection $sourceConn
-
-        New-TargetSite
-        $targetConn = Invoke-TargetTemplate
+        Invoke-Step 1 { Initialize-Prerequisites }
+        $sourceConn = Invoke-Step 2 { Connect-Site -Url $SourceUrl -Label 'site source' }
+        Invoke-Step 3 { Export-SourceTemplate -Connection $sourceConn }
+        Invoke-Step 4 { New-TargetSite }
+        $targetConn = Invoke-Step 5 { Invoke-TargetTemplate }
 
         $copyStats = $null
         if ($targetConn -and -not $DryRun) {
-            $copyStats = Copy-LibrariesContent -SourceConn $sourceConn -TargetConn $targetConn
+            $copyStats = Invoke-Step 6 { Copy-LibrariesContent -SourceConn $sourceConn -TargetConn $targetConn }
         }
         elseif ($DryRun) {
-            $copyStats = Copy-LibrariesContent -SourceConn $sourceConn -TargetConn $sourceConn
+            $copyStats = Invoke-Step 6 { Copy-LibrariesContent -SourceConn $sourceConn -TargetConn $sourceConn }
+        }
+        else {
+            Set-StepSkipped 6 'aucune connexion cible'
         }
 
-        Write-FinalReport -SourceConn $sourceConn -TargetConn $targetConn -CopyStats $copyStats
+        Invoke-Step 7 { Write-FinalReport -SourceConn $sourceConn -TargetConn $targetConn -CopyStats $copyStats }
+        Show-StepChecklist
     }
 
     Write-Log "=== Terminé avec succès ===" 'OK'
@@ -671,7 +822,7 @@ try {
 catch {
     Write-Log "ÉCHEC GLOBAL : $($_.Exception.Message)" 'ERROR'
     Write-Log "Trace : $($_.ScriptStackTrace)" 'DEBUG'
-    Write-Progress -Id 1 -Activity 'Duplication SharePoint' -Completed
+    Show-StepChecklist   # montre à l'admin où l'exécution s'est arrêtée
     exit 1
 }
 finally {
