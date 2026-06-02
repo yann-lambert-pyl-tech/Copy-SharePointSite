@@ -514,6 +514,15 @@ function Export-SourceTemplate {
     if ($IncludePermissions) {
         $handlerList.Add('SiteSecurity')
         Write-Log "ACL activées : permissions du site incluses (groupes/rôles)." 'INFO'
+        # Vérification : on remonte en INFO les comptes (adresses) présents sur le site source.
+        try {
+            $users = @(Get-PnPUser -Connection $Connection | Where-Object { $_.Email -and $_.PrincipalType -eq 'User' })
+            Write-Log ("ACL source — comptes avec adresse ({0}) :" -f $users.Count) 'INFO'
+            foreach ($u in $users) { Write-Log ("   - {0} <{1}>" -f $u.Title, $u.Email) 'INFO' }
+        }
+        catch {
+            Write-Log "Impossible de lister les comptes du site source : $($_.Exception.Message)" 'WARN'
+        }
     }
     else {
         Write-Log "ACL désactivées : permissions NON copiées (héritage par défaut du nouveau site)." 'INFO'
@@ -776,6 +785,31 @@ function Connect-Tenant {
     return $conn
 }
 
+function Write-DetectedTeamAcl {
+    # Remonte en INFO les owners et members de l'équipe source (vérification ACL).
+    param(
+        [Parameter(Mandatory = $true)][string]$TeamId,
+        [Parameter(Mandatory = $true)]$Connection
+    )
+    Write-Log "Lecture des ACL de l'équipe source (vérification)..." 'INFO'
+    foreach ($rel in 'owners', 'members') {
+        try {
+            $resp = Invoke-WithRetry -Operation "lecture $rel source" -Action {
+                Invoke-PnPGraphMethod -Url "v1.0/groups/$TeamId/$rel`?`$select=displayName,userPrincipalName,mail&`$top=999" -Method Get -Connection $Connection
+            }
+            $people = @($resp.value)
+            Write-Log ("ACL source — {0} ({1}) :" -f $rel, $people.Count) 'INFO'
+            foreach ($p in $people) {
+                $addr = if ($p.userPrincipalName) { $p.userPrincipalName } elseif ($p.mail) { $p.mail } else { '(sans adresse)' }
+                Write-Log ("   - {0} <{1}>" -f $p.displayName, $addr) 'INFO'
+            }
+        }
+        catch {
+            Write-Log "Impossible de lire '$rel' de l'équipe source : $($_.Exception.Message)" 'WARN'
+        }
+    }
+}
+
 function Copy-Team {
     [CmdletBinding(SupportsShouldProcess = $true)]
     param([Parameter(Mandatory = $true)]$Connection)
@@ -803,6 +837,8 @@ function Copy-Team {
     if ($IncludePermissions) {
         $parts += 'members'
         Write-Log "ACL activées : membres et owners de l'équipe inclus dans le clone." 'INFO'
+        # Vérification : on remonte en INFO les identités détectées côté source.
+        Write-DetectedTeamAcl -TeamId $SourceTeamId -Connection $Connection
     }
     else {
         Write-Log "ACL désactivées : seul l'appelant sera owner de la nouvelle équipe." 'INFO'
