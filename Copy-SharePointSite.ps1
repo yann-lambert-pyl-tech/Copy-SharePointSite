@@ -27,6 +27,17 @@
       Canaux, onglets, apps et paramètres clonés ; membres/owners (ACL) seulement
       si -IncludePermissions. Le site SharePoint de l'équipe est recréé d'office.
 
+    MODE LOT (-ConfigCsv) — enchaîne plusieurs opérations décrites dans un CSV :
+      Une ligne = une opération (Site ou Team via la colonne Mode). Chaque opération
+      est exécutée comme un run complet (bannière, étapes, rapport) ; un résumé
+      global est affiché et exporté en CSV à la fin. Un échec n'interrompt pas le lot.
+
+.PARAMETER ConfigCsv
+    (Mode LOT) Chemin d'un CSV décrivant les opérations. Colonnes reconnues :
+    Mode, SourceUrl, TargetUrl, TargetTitle, TargetType, Owner, IncludeContent,
+    SourceTeamId, NewTeamName, TenantUrl, Visibility, IncludePermissions, DryRun.
+    Les switches globaux -DryRun et -IncludePermissions s'ajoutent (OR) à chaque ligne.
+
 .PARAMETER IncludePermissions
     Copie les ACL. Mode SITE : inclut le handler SiteSecurity (groupes/rôles).
     Mode TEAM : ajoute 'members' aux éléments clonés (membres + owners).
@@ -89,6 +100,10 @@
         -NewTeamName "Projet Alpha (copie)" -TenantUrl https://contoso.sharepoint.com `
         -IncludePermissions
 
+.EXAMPLE
+    # Lot : enchaîne toutes les opérations du CSV, en simulation pour valider d'abord
+    .\Copy-SharePointSite.ps1 -ConfigCsv .\operations.csv -DryRun
+
 .NOTES
     Auteur  : Pyl.Tech
     Pré-requis : Install-Module PnP.PowerShell -Scope CurrentUser
@@ -135,7 +150,16 @@ param(
     [ValidateSet('Private', 'Public')]
     [string]$Visibility = 'Private',
 
-    # --- Paramètres communs aux deux modes ---
+    # --- Jeu de paramètres CSV (traitement par lot) ---
+    # Chaque ligne du CSV = une opération (Site ou Team). Colonnes reconnues :
+    #   Mode, SourceUrl, TargetUrl, TargetTitle, TargetType, Owner, IncludeContent,
+    #   SourceTeamId, NewTeamName, TenantUrl, Visibility, IncludePermissions, DryRun
+    # Les colonnes booléennes acceptent : true/1/yes/oui/o/x (sinon false).
+    [Parameter(Mandatory = $true, ParameterSetName = 'Csv')]
+    [ValidateScript({ Test-Path -Path $_ -PathType Leaf })]
+    [string]$ConfigCsv,
+
+    # --- Paramètres communs à tous les modes ---
     # ACL : copie des permissions (groupes/rôles du site, ou membres/owners de l'équipe).
     [Parameter(Mandatory = $false)]
     [switch]$IncludePermissions,
@@ -735,94 +759,255 @@ function Copy-Team {
 }
 #endregion
 
+#region ░░ STREAM 8ter : Traitement par lot (CSV) ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+# Lit un CSV d'opérations, exécute chacune comme un run complet (via
+# Invoke-CopyOperation), et produit un résumé global exporté en CSV.
+# Une opération en échec n'interrompt pas le lot.
+
+function ConvertTo-Bool {
+    # Interprète une valeur de cellule CSV comme un booléen tolérant.
+    param($Value)
+    return ("$Value").Trim() -match '^(1|true|vrai|yes|oui|y|o|x)$'
+}
+
+function Set-OperationContext {
+    # Aligne les variables de script (lues par les fonctions métier) sur la ligne courante.
+    param(
+        [Parameter(Mandatory = $true)]$Op,
+        [int]$Index = 1
+    )
+    $script:OpMode      = if ($Op.Mode) { "$($Op.Mode)".Trim() } else { 'Site' }
+    $script:SourceUrl   = $Op.SourceUrl
+    $script:TargetUrl   = $Op.TargetUrl
+    $script:TargetTitle = $Op.TargetTitle
+    $script:TargetType  = if ($Op.TargetType) { "$($Op.TargetType)".Trim() } else { 'CommunicationSite' }
+    $script:Owner       = $Op.Owner
+    $script:SourceTeamId = $Op.SourceTeamId
+    $script:NewTeamName  = $Op.NewTeamName
+    $script:TenantUrl    = $Op.TenantUrl
+    $script:Visibility   = if ($Op.Visibility) { "$($Op.Visibility)".Trim() } else { 'Private' }
+    # Booléens : valeur de ligne OU switch global (sécurité : -DryRun force tout le lot).
+    $script:IncludeContent     = ConvertTo-Bool $Op.IncludeContent
+    $script:IncludePermissions = (ConvertTo-Bool $Op.IncludePermissions) -or $script:GlobalAcl
+    $script:DryRun             = (ConvertTo-Bool $Op.DryRun) -or $script:GlobalDryRun
+    # Modèle PnP unique par opération (évite l'écrasement entre lignes).
+    $script:TemplateFile = Join-Path $LogPath ("SiteTemplate_{0:yyyyMMdd_HHmmss}_op{1:D2}.pnp" -f $script:StartTime, $Index)
+}
+
+function Import-OperationCsv {
+    # Lit et valide (minimalement) le CSV d'opérations.
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $rows = Import-Csv -Path $Path
+    if (-not $rows) { throw "CSV vide ou illisible : $Path" }
+
+    $ops = [System.Collections.Generic.List[object]]::new()
+    $n = 0
+    foreach ($row in $rows) {
+        $n++
+        $mode = if ($row.PSObject.Properties.Name -contains 'Mode' -and $row.Mode) { "$($row.Mode)".Trim() } else { 'Site' }
+        if ($mode -eq 'Team') {
+            if (-not $row.SourceTeamId -or -not $row.NewTeamName -or -not $row.TenantUrl) {
+                throw "Ligne $n (Team) : colonnes SourceTeamId, NewTeamName et TenantUrl requises."
+            }
+        }
+        else {
+            if (-not $row.SourceUrl -or -not $row.TargetUrl) {
+                throw "Ligne $n (Site) : colonnes SourceUrl et TargetUrl requises."
+            }
+        }
+        $ops.Add($row)
+    }
+    return $ops
+}
+
+function Invoke-CopyOperation {
+    # Exécute UNE opération (Site ou Team) de bout en bout et renvoie un objet résultat.
+    # Ne lève jamais : un échec est capturé et reporté dans le résultat (Status=FAILED).
+    param(
+        [Parameter(Mandatory = $true)]$Op,
+        [int]$Index = 1,
+        [int]$Count = 1
+    )
+    Set-OperationContext -Op $Op -Index $Index
+    $aclLabel = if ($IncludePermissions) { 'Copiées' } else { 'Non copiées' }
+    $result = [ordered]@{
+        Index = $Index; Mode = $script:OpMode; Target = ''; Status = 'OK'
+        Files = 0; Errors = 0; Message = ''
+    }
+    if ($Count -gt 1) { Write-Log ("══════ Opération {0}/{1} ({2}) ══════" -f $Index, $Count, $script:OpMode) 'STEP' }
+
+    try {
+        if ($script:OpMode -eq 'Team') {
+            # ----- Opération TEAM -----
+            $result.Target = $NewTeamName
+            Write-Banner -Title "CLONAGE MICROSOFT TEAMS" -Fields ([ordered]@{
+                'Équipe source' = $SourceTeamId
+                'Nouvelle'      = $NewTeamName
+                'Tenant'        = $TenantUrl
+                'Visibilité'    = $Visibility
+                'ACL (membres)' = $aclLabel
+                'Mode'          = $(if ($DryRun) { 'DRYRUN (simulation)' } else { 'Réel' })
+                'Log'           = $script:LogFile
+            })
+            Initialize-StepTracker -Activity 'Clonage Teams' -StepLabels @(
+                'Pré-requis (module PnP)',
+                'Connexion tenant (Graph)',
+                'Clonage de l''équipe'
+            )
+            Invoke-Step 1 { Initialize-Prerequisites }
+            $tenantConn = Invoke-Step 2 { Connect-Tenant -Url $TenantUrl }
+            $teamResult = Invoke-Step 3 { Copy-Team -Connection $tenantConn }
+
+            Show-StepChecklist
+            Write-Banner -Title "RAPPORT DE CLONAGE TEAMS" -Fields ([ordered]@{
+                'Équipe source' = $(if ($teamResult) { $teamResult.Source } else { '-' })
+                'Nouvelle'      = $NewTeamName
+                'Éléments'      = $(if ($teamResult) { $teamResult.Parts } else { '-' })
+                'Statut'        = $(if ($teamResult) { $teamResult.Status } else { '-' })
+                'ACL (membres)' = $aclLabel
+            })
+        }
+        else {
+            # ----- Opération SITE -----
+            $result.Target = $TargetUrl
+            Write-Banner -Title "DUPLICATION DE SITE SHAREPOINT" -Fields ([ordered]@{
+                'Source'  = $SourceUrl
+                'Cible'   = $TargetUrl
+                'Type'    = $TargetType
+                'Contenu' = $(if ($IncludeContent) { 'Inclus' } else { 'Structure seule' })
+                'ACL'     = $aclLabel
+                'Mode'    = $(if ($DryRun) { 'DRYRUN (simulation)' } else { 'Réel' })
+                'Log'     = $script:LogFile
+            })
+            Initialize-StepTracker -Activity 'Duplication SharePoint' -StepLabels @(
+                'Pré-requis (module PnP)',
+                'Connexion au site source',
+                'Extraction du modèle',
+                'Provisioning du site cible',
+                'Application du modèle',
+                'Copie du contenu',
+                'Vérification & rapport'
+            )
+            Invoke-Step 1 { Initialize-Prerequisites }
+            $sourceConn = Invoke-Step 2 { Connect-Site -Url $SourceUrl -Label 'site source' }
+            Invoke-Step 3 { Export-SourceTemplate -Connection $sourceConn }
+            Invoke-Step 4 { New-TargetSite }
+            $targetConn = Invoke-Step 5 { Invoke-TargetTemplate }
+
+            $copyStats = $null
+            if ($targetConn -and -not $DryRun) {
+                $copyStats = Invoke-Step 6 { Copy-LibrariesContent -SourceConn $sourceConn -TargetConn $targetConn }
+            }
+            elseif ($DryRun) {
+                $copyStats = Invoke-Step 6 { Copy-LibrariesContent -SourceConn $sourceConn -TargetConn $sourceConn }
+            }
+            else {
+                Set-StepSkipped 6 'aucune connexion cible'
+            }
+
+            Invoke-Step 7 { Write-FinalReport -SourceConn $sourceConn -TargetConn $targetConn -CopyStats $copyStats }
+            Show-StepChecklist
+
+            if ($copyStats) { $result.Files = $copyStats.Files; $result.Errors = $copyStats.Errors }
+        }
+        $result.Status = if ($DryRun) { 'DRYRUN' } else { 'OK' }
+    }
+    catch {
+        $result.Status  = 'FAILED'
+        $result.Message = $_.Exception.Message
+        Write-Log "ÉCHEC de l'opération $Index : $($_.Exception.Message)" 'ERROR'
+        Write-Log "Trace : $($_.ScriptStackTrace)" 'DEBUG'
+        Show-StepChecklist
+    }
+    finally {
+        # Repart d'un contexte propre pour l'opération suivante.
+        try { Disconnect-PnPOnline -ErrorAction SilentlyContinue } catch {}
+    }
+    return [pscustomobject]$result
+}
+
+function Show-BatchSummary {
+    # Récap final du lot (console) + export CSV des résultats.
+    param([Parameter(Mandatory = $true)]$Results)
+    $bar = '═' * 64
+    Write-Host ""
+    Write-Host $bar -ForegroundColor Cyan
+    Write-Host "  RÉSUMÉ DU TRAITEMENT PAR LOT" -ForegroundColor Cyan
+    Write-Host $bar -ForegroundColor Cyan
+    foreach ($r in $Results) {
+        $c = switch ($r.Status) { 'OK' { 'Green' } 'DRYRUN' { 'Yellow' } 'FAILED' { 'Red' } default { 'Gray' } }
+        Write-Host ("  #{0,-2} [{1,-6}] {2,-5} {3}" -f $r.Index, $r.Status, $r.Mode, $r.Target) -ForegroundColor $c
+        if ($r.Status -eq 'FAILED' -and $r.Message) {
+            Write-Host ("         └─ {0}" -f $r.Message) -ForegroundColor DarkGray
+        }
+    }
+    $ok = ($Results | Where-Object { $_.Status -eq 'OK' }).Count
+    $dr = ($Results | Where-Object { $_.Status -eq 'DRYRUN' }).Count
+    $ko = ($Results | Where-Object { $_.Status -eq 'FAILED' }).Count
+    Write-Host $bar -ForegroundColor Cyan
+    Write-Host ("  Total {0}  |  OK {1}  |  DryRun {2}  |  Échecs {3}" -f $Results.Count, $ok, $dr, $ko)
+    Write-Host $bar -ForegroundColor Cyan
+    Write-Host ""
+
+    $outCsv = Join-Path $LogPath ("BatchResult_{0:yyyyMMdd_HHmmss}.csv" -f $script:StartTime)
+    $Results | Export-Csv -Path $outCsv -NoTypeInformation -Encoding UTF8
+    Write-Log "Résultats du lot exportés : $outCsv" 'OK'
+}
+#endregion
+
 #region ░░ STREAM 9 : Orchestration (Main) ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
-# Enchaîne les streams, gère le transcript et les erreurs globales.
+# Dispatch : run unique (Site/Team) OU traitement par lot (CSV). Transcript + erreurs.
 
 try {
     Start-Transcript -Path (Join-Path $LogPath ("Transcript_{0:yyyyMMdd_HHmmss}.log" -f $script:StartTime)) -Force | Out-Null
 
-    $mode = $PSCmdlet.ParameterSetName
-    $aclLabel = if ($IncludePermissions) { 'Copiées' } else { 'Non copiées' }
+    # Switches globaux : s'appliquent (OR) à chaque opération.
+    $script:GlobalDryRun = $DryRun.IsPresent
+    $script:GlobalAcl    = $IncludePermissions.IsPresent
 
-    if ($mode -eq 'Team') {
-        # ---------- MODE TEAM : clonage d'une équipe Microsoft Teams ----------
-        Write-Banner -Title "CLONAGE MICROSOFT TEAMS" -Fields ([ordered]@{
-            'Équipe source' = $SourceTeamId
-            'Nouvelle'      = $NewTeamName
-            'Tenant'        = $TenantUrl
-            'Visibilité'    = $Visibility
-            'ACL (membres)' = $aclLabel
-            'Mode'          = $(if ($DryRun) { 'DRYRUN (simulation)' } else { 'Réel' })
-            'Log'           = $script:LogFile
-        })
-        Initialize-StepTracker -Activity 'Clonage Teams' -StepLabels @(
-            'Pré-requis (module PnP)',
-            'Connexion tenant (Graph)',
-            'Clonage de l''équipe'
-        )
+    if ($PSCmdlet.ParameterSetName -eq 'Csv') {
+        # ---------- MODE LOT ----------
+        Write-Log "Mode LOT — lecture du CSV : $ConfigCsv" 'STEP'
+        $ops = Import-OperationCsv -Path $ConfigCsv
+        Write-Log ("{0} opération(s) à traiter." -f $ops.Count) 'INFO'
 
-        Invoke-Step 1 { Initialize-Prerequisites }
-        $tenantConn = Invoke-Step 2 { Connect-Tenant -Url $TenantUrl }
-        $teamResult = Invoke-Step 3 { Copy-Team -Connection $tenantConn }
+        $results = [System.Collections.Generic.List[object]]::new()
+        $i = 0
+        foreach ($op in $ops) {
+            $i++
+            $results.Add( (Invoke-CopyOperation -Op $op -Index $i -Count $ops.Count) )
+        }
 
-        Show-StepChecklist
-        Write-Banner -Title "RAPPORT DE CLONAGE TEAMS" -Fields ([ordered]@{
-            'Équipe source' = $(if ($teamResult) { $teamResult.Source } else { '-' })
-            'Nouvelle'      = $NewTeamName
-            'Éléments'      = $(if ($teamResult) { $teamResult.Parts } else { '-' })
-            'Statut'        = $(if ($teamResult) { $teamResult.Status } else { '-' })
-            'ACL (membres)' = $aclLabel
-        })
+        Show-BatchSummary -Results $results
+        $failed = ($results | Where-Object { $_.Status -eq 'FAILED' }).Count
+        Write-Log ("=== Lot terminé ({0} échec(s)) ===" -f $failed) $(if ($failed) { 'WARN' } else { 'OK' })
+        exit ([int]($failed -gt 0))
     }
     else {
-        # ---------- MODE SITE : duplication d'un site SharePoint ----------
-        Write-Banner -Title "DUPLICATION DE SITE SHAREPOINT" -Fields ([ordered]@{
-            'Source'      = $SourceUrl
-            'Cible'       = $TargetUrl
-            'Type'        = $TargetType
-            'Contenu'     = $(if ($IncludeContent) { 'Inclus' } else { 'Structure seule' })
-            'ACL'         = $aclLabel
-            'Mode'        = $(if ($DryRun) { 'DRYRUN (simulation)' } else { 'Réel' })
-            'Log'         = $script:LogFile
-        })
-        Initialize-StepTracker -Activity 'Duplication SharePoint' -StepLabels @(
-            'Pré-requis (module PnP)',
-            'Connexion au site source',
-            'Extraction du modèle',
-            'Provisioning du site cible',
-            'Application du modèle',
-            'Copie du contenu',
-            'Vérification & rapport'
-        )
-
-        Invoke-Step 1 { Initialize-Prerequisites }
-        $sourceConn = Invoke-Step 2 { Connect-Site -Url $SourceUrl -Label 'site source' }
-        Invoke-Step 3 { Export-SourceTemplate -Connection $sourceConn }
-        Invoke-Step 4 { New-TargetSite }
-        $targetConn = Invoke-Step 5 { Invoke-TargetTemplate }
-
-        $copyStats = $null
-        if ($targetConn -and -not $DryRun) {
-            $copyStats = Invoke-Step 6 { Copy-LibrariesContent -SourceConn $sourceConn -TargetConn $targetConn }
+        # ---------- RUN UNIQUE ----------
+        $op = @{
+            Mode               = $PSCmdlet.ParameterSetName   # 'Site' ou 'Team'
+            SourceUrl          = $SourceUrl
+            TargetUrl          = $TargetUrl
+            TargetTitle        = $TargetTitle
+            TargetType         = $TargetType
+            Owner              = $Owner
+            IncludeContent     = $IncludeContent.IsPresent
+            SourceTeamId       = $SourceTeamId
+            NewTeamName        = $NewTeamName
+            TenantUrl          = $TenantUrl
+            Visibility         = $Visibility
+            IncludePermissions = $IncludePermissions.IsPresent
+            DryRun             = $DryRun.IsPresent
         }
-        elseif ($DryRun) {
-            $copyStats = Invoke-Step 6 { Copy-LibrariesContent -SourceConn $sourceConn -TargetConn $sourceConn }
-        }
-        else {
-            Set-StepSkipped 6 'aucune connexion cible'
-        }
-
-        Invoke-Step 7 { Write-FinalReport -SourceConn $sourceConn -TargetConn $targetConn -CopyStats $copyStats }
-        Show-StepChecklist
+        $r = Invoke-CopyOperation -Op $op
+        Write-Log "=== Terminé (statut: $($r.Status)) ===" $(if ($r.Status -eq 'FAILED') { 'ERROR' } else { 'OK' })
+        exit ([int]($r.Status -eq 'FAILED'))
     }
-
-    Write-Log "=== Terminé avec succès ===" 'OK'
-    exit 0
 }
 catch {
     Write-Log "ÉCHEC GLOBAL : $($_.Exception.Message)" 'ERROR'
     Write-Log "Trace : $($_.ScriptStackTrace)" 'DEBUG'
-    Show-StepChecklist   # montre à l'admin où l'exécution s'est arrêtée
     exit 1
 }
 finally {
