@@ -725,10 +725,10 @@ function Copy-Team {
     $alias = ($NewTeamName -replace '[^a-zA-Z0-9]', '')
     if (-not $alias) { $alias = "team$($script:StartTime.ToString('yyyyMMddHHmmss'))" }
 
-    # -Owner en mode Team : le clone Graph est asynchrone et rend l'appelant
-    # propriétaire ; un owner explicite doit être ajouté après coup.
+    # -Owner en mode Team : le clone Graph rend l'appelant propriétaire ;
+    # l'owner explicite est attribué après coup (étape dédiée via Add-TeamOwner).
     if ($Owner) {
-        Write-Log "Propriétaire demandé : $Owner — à ajouter à la nouvelle équipe après le clone (opération asynchrone)." 'WARN'
+        Write-Log "Propriétaire '$Owner' : sera attribué à la nouvelle équipe après le clone." 'INFO'
     }
 
     # ACL : les membres/owners ne sont clonés que si demandé.
@@ -751,7 +751,7 @@ function Copy-Team {
 
     if ($DryRun) {
         Write-Log "[DRYRUN] Clonerait l'équipe -> '$NewTeamName' (alias '$alias', parts: $($body.partsToClone))." 'WARN'
-        return [ordered]@{ Mode = 'Team'; Source = $srcTeam.displayName; NewTeam = $NewTeamName; Parts = $body.partsToClone; Status = 'DRYRUN' }
+        return [ordered]@{ Mode = 'Team'; Source = $srcTeam.displayName; NewTeam = $NewTeamName; Alias = $alias; Parts = $body.partsToClone; Status = 'DRYRUN' }
     }
     if (-not $PSCmdlet.ShouldProcess($NewTeamName, "Cloner l'équipe Teams $SourceTeamId")) { return }
 
@@ -761,9 +761,63 @@ function Copy-Team {
     } | Out-Null
 
     Write-Log "Demande de clonage envoyée (traitement asynchrone côté Microsoft 365)." 'OK'
-    Write-Log "La nouvelle équipe '$NewTeamName' apparaîtra dans Teams sous quelques minutes." 'INFO'
 
-    return [ordered]@{ Mode = 'Team'; Source = $srcTeam.displayName; NewTeam = $NewTeamName; Parts = $body.partsToClone; Status = 'Submitted' }
+    return [ordered]@{ Mode = 'Team'; Source = $srcTeam.displayName; NewTeam = $NewTeamName; Alias = $alias; Parts = $body.partsToClone; Status = 'Submitted' }
+}
+
+function Add-TeamOwner {
+    # Attend que l'équipe clonée existe (clone asynchrone), puis attribue le propriétaire.
+    # Recherche le groupe par mailNickname, puis ajoute l'utilisateur en owner ET membre
+    # (un owner d'équipe Teams doit aussi être membre). Renvoie l'id du groupe.
+    param(
+        [Parameter(Mandatory = $true)][string]$Alias,
+        [Parameter(Mandatory = $true)][string]$OwnerUpn,
+        [Parameter(Mandatory = $true)]$Connection,
+        [int]$TimeoutMinutes = 10
+    )
+    Write-Log "Attribution du propriétaire '$OwnerUpn' à l'équipe clonée..." 'STEP'
+
+    # 1) Attendre l'apparition du groupe cloné (recherche par mailNickname).
+    $filterValue = [uri]::EscapeDataString("mailNickname eq '$Alias'")
+    $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+    $group = $null
+    do {
+        Start-Sleep -Seconds 15
+        $resp = Invoke-WithRetry -Operation 'recherche du groupe cloné' -Action {
+            Invoke-PnPGraphMethod -Url "v1.0/groups?`$filter=$filterValue&`$select=id,displayName" -Method Get -Connection $Connection
+        }
+        if ($resp.value -and $resp.value.Count -ge 1) { $group = $resp.value[0] }
+        else { Write-Log "Équipe pas encore prête, nouvelle vérification dans 15s..." 'INFO' }
+    } while (-not $group -and (Get-Date) -lt $deadline)
+
+    if (-not $group) {
+        throw "Équipe clonée introuvable (mailNickname '$Alias') après $TimeoutMinutes min — propriétaire non attribué."
+    }
+    Write-Log "Groupe cloné détecté : '$($group.displayName)' ($($group.id))." 'OK'
+
+    # 2) Résoudre l'utilisateur cible.
+    $user = Invoke-WithRetry -Operation 'résolution du compte owner' -Action {
+        Invoke-PnPGraphMethod -Url "v1.0/users/$($OwnerUpn)?`$select=id,userPrincipalName" -Method Get -Connection $Connection
+    }
+    $ref = @{ '@odata.id' = "https://graph.microsoft.com/v1.0/directoryObjects/$($user.id)" }
+
+    # 3) Ajouter en owner ET en membre (idempotent : 'already exist' est ignoré).
+    foreach ($rel in 'members', 'owners') {
+        try {
+            Invoke-WithRetry -Operation "ajout dans $rel" -Action {
+                Invoke-PnPGraphMethod -Url "v1.0/groups/$($group.id)/$rel/`$ref" -Method Post -Content $ref -Connection $Connection
+            } | Out-Null
+            Write-Log "Ajouté dans '$rel' : $OwnerUpn." 'OK'
+        }
+        catch {
+            if ("$($_.Exception.Message)" -match 'already exist') {
+                Write-Log "$OwnerUpn déjà présent dans '$rel'." 'INFO'
+            }
+            else { throw }
+        }
+    }
+    Write-Log "Propriétaire '$OwnerUpn' attribué à l'équipe '$($group.displayName)'." 'OK'
+    return $group.id
 }
 #endregion
 
@@ -860,11 +914,23 @@ function Invoke-CopyOperation {
             Initialize-StepTracker -Activity 'Clonage Teams' -StepLabels @(
                 'Pré-requis (module PnP)',
                 'Connexion tenant (Graph)',
-                'Clonage de l''équipe'
+                'Clonage de l''équipe',
+                'Attribution du propriétaire'
             )
             Invoke-Step 1 { Initialize-Prerequisites }
             $tenantConn = Invoke-Step 2 { Connect-Tenant -Url $TenantUrl }
             $teamResult = Invoke-Step 3 { Copy-Team -Connection $tenantConn }
+
+            # Étape 4 : attribuer le propriétaire (poll + ajout owner/membre).
+            if ($Owner -and -not $DryRun -and $teamResult -and $teamResult.Status -eq 'Submitted') {
+                Invoke-Step 4 { Add-TeamOwner -Alias $teamResult.Alias -OwnerUpn $Owner -Connection $tenantConn }
+            }
+            else {
+                $reason = if (-not $Owner) { 'aucun -Owner spécifié' }
+                          elseif ($DryRun) { 'DryRun' }
+                          else { 'clone non soumis' }
+                Set-StepSkipped 4 $reason
+            }
 
             Show-StepChecklist
             Write-Banner -Title "RAPPORT DE CLONAGE TEAMS" -Fields ([ordered]@{
