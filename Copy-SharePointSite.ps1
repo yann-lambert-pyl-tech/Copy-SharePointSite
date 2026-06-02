@@ -108,6 +108,10 @@
     Set-UnifiedGroup si Exchange Online est connecté). Les notifications Teams in-app
     ne sont pas supprimables via API.
 
+.PARAMETER ThrottleLimit
+    Nombre de threads pour la copie de fichiers (PowerShell 7). Défaut 4. Le parallélisme
+    ne s'active qu'en auth par certificat (-Thumbprint) ; sinon copie séquentielle. 1 = séquentiel.
+
 .PARAMETER LogPath
     Dossier de sortie des logs et du modèle exporté. Défaut : .\_SPCopy_Logs
 
@@ -232,6 +236,12 @@ param(
     [Parameter(Mandatory = $false)]
     [switch]$MuteNotifications,
 
+    # Copie multithread des fichiers (PowerShell 7). >1 active le parallélisme,
+    # uniquement en auth certificat (reconnexion sans MFA dans les runspaces).
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 32)]
+    [int]$ThrottleLimit = 4,
+
     [Parameter(Mandatory = $false)]
     [string]$ClientId,
 
@@ -260,6 +270,7 @@ param(
 # Arrête au premier appel .NET/cmdlet non géré (les try/catch restent maîtres).
 $ErrorActionPreference = 'Stop'
 $script:StartTime = Get-Date
+$script:AclHintShown = $false   # indice "Accès refusé" affiché une seule fois
 
 #region ░░ STREAM 1 : Journalisation ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 # Log unifié : fichier horodaté + console colorée. Toutes les couches l'utilisent.
@@ -684,6 +695,21 @@ function Invoke-TargetTemplate {
 # Copie fichiers+dossiers de chaque bibliothèque de documents source -> cible.
 # Sous-barre de progression (Id 2) imbriquée dans la barre globale (Id 1).
 
+function Test-AccessDenied {
+    param([string]$Message)
+    return "$Message" -match '(?i)acc[eè]s refus|access[- ]?denied|unauthorized|forbidden|\b403\b'
+}
+
+function Write-CopyError {
+    # Journalise une erreur de copie + (une seule fois) un indice si c'est un refus d'accès.
+    param([string]$Path, [string]$Message)
+    Write-Log ("Erreur copie{0} : {1}" -f $(if ($Path) { " '$Path'" } else { '' }), $Message) 'ERROR'
+    if (-not $script:AclHintShown -and (Test-AccessDenied $Message)) {
+        $script:AclHintShown = $true
+        Write-Log "INDICE 'Accès refusé' : en auth app-only, la copie de fichiers passe par l'API SharePoint (pas Graph). L'app doit avoir 'Sites.FullControl.All' (API *SharePoint*, consentement admin) OU 'Sites.Selected' accordé EXPLICITEMENT sur les sites source ET cible (Grant-PnPAzureADAppSitePermission). NB : une équipe/site SOURCE archivé(e) est en lecture seule." 'WARN'
+    }
+}
+
 function Copy-LibrariesContent {
     [CmdletBinding()]
     param(
@@ -692,12 +718,24 @@ function Copy-LibrariesContent {
     )
     Write-Log "Copie du contenu des bibliothèques de documents..." 'STEP'
 
-    # Bibliothèques de documents non masquées (BaseTemplate 101).
-    $libs = Get-PnPList -Connection $SourceConn |
-        Where-Object { $_.BaseTemplate -eq 101 -and -not $_.Hidden }
+    # URLs réelles des sites (utiles pour la reconnexion dans les runspaces parallèles).
+    $srcSiteUrl = (Get-PnPWeb -Connection $SourceConn).Url
+    $dstSiteUrl = (Get-PnPWeb -Connection $TargetConn).Url
+    $srcWebPath = [uri]::UnescapeDataString(([uri]$srcSiteUrl).AbsolutePath)
 
-    $stats = [ordered]@{ Libraries = 0; Files = 0; Folders = 0; Errors = 0; SkippedBytes = 0 }
+    # Multithread : uniquement en auth certificat (reconnexion sans MFA dans les runspaces).
+    $parallel = ($Thumbprint -and $ThrottleLimit -gt 1)
+    if ($ThrottleLimit -gt 1 -and -not $Thumbprint) {
+        Write-Log "Multithread ignoré : nécessite l'auth par certificat (-Thumbprint). Copie séquentielle." 'WARN'
+    }
+    if ($parallel) {
+        $tenant = if ($TenantId) { $TenantId } else { Get-TenantDomain -AnyUrl $srcSiteUrl }
+        Write-Log "Copie MULTITHREAD activée : $ThrottleLimit threads (auth certificat)." 'INFO'
+    }
 
+    $stats = [ordered]@{ Libraries = 0; Files = 0; Folders = 0; Errors = 0 }
+
+    $libs = Get-PnPList -Connection $SourceConn | Where-Object { $_.BaseTemplate -eq 101 -and -not $_.Hidden }
     foreach ($lib in $libs) {
         $stats.Libraries++
         Write-Log "Bibliothèque : '$($lib.Title)' ($($lib.ItemCount) éléments)." 'INFO'
@@ -706,60 +744,84 @@ function Copy-LibrariesContent {
             Get-PnPListItem -List $lib -PageSize 500 -Connection $SourceConn -Fields 'FileLeafRef', 'FileRef', 'FSObjType'
         }
 
-        # Préfixe de chemin (web) décodé : FileRef est non-échappé, AbsolutePath est échappé.
-        $srcWebPath = [uri]::UnescapeDataString(([uri]$SourceUrl).AbsolutePath)
-
-        # Dossiers d'abord, puis par profondeur croissante : la structure existe avant les fichiers.
-        $ordered = $items | Sort-Object `
-            @{ Expression = { if ($_['FSObjType'] -eq 1) { 0 } else { 1 } } }, `
-            @{ Expression = { "$($_['FileRef'])".Split('/').Count } }
-
-        $n = 0; $total = [math]::Max($ordered.Count, 1)
-        foreach ($item in $ordered) {
-            $n++
-            $serverRel = $item['FileRef']
-            $isFolder  = ($item['FSObjType'] -eq 1)
-            $leaf       = $item['FileLeafRef']
-            Write-Progress -Id 2 -ParentId 1 -Activity "Bibliothèque '$($lib.Title)'" `
-                -Status "$n/$total : $leaf" -PercentComplete (($n / $total) * 100)
-
-            # Chemin relatif au web (sans le préfixe du site source), puis dossier parent côté cible.
-            $relToWeb     = $serverRel.Substring($srcWebPath.Length).TrimStart('/')
-            $parentRelDir = if ($relToWeb.Contains('/')) { $relToWeb.Substring(0, $relToWeb.LastIndexOf('/')) } else { '' }
-
-            if ($DryRun) {
-                Write-Log "[DRYRUN] Copierait : $serverRel -> <cible>/$relToWeb" 'DEBUG'
-                if ($isFolder) { $stats.Folders++ } else { $stats.Files++ }
-                continue
+        # Séparer dossiers / fichiers (chemins relatifs au web).
+        $folders = [System.Collections.Generic.List[string]]::new()
+        $files   = [System.Collections.Generic.List[object]]::new()
+        foreach ($it in $items) {
+            $rel = "$($it['FileRef'])".Substring($srcWebPath.Length).TrimStart('/')
+            if ($it['FSObjType'] -eq 1) { $folders.Add($rel) }
+            else {
+                $parent = if ($rel.Contains('/')) { $rel.Substring(0, $rel.LastIndexOf('/')) } else { '' }
+                $files.Add([pscustomobject]@{ Src = $it['FileRef']; Leaf = $it['FileLeafRef']; Folder = $parent })
             }
+        }
 
-            try {
-                if ($isFolder) {
-                    # Crée l'arborescence (site-relative) côté cible.
-                    Resolve-PnPFolder -SiteRelativePath $relToWeb -Connection $TargetConn -ErrorAction Stop | Out-Null
-                    $stats.Folders++
+        if ($DryRun) {
+            Write-Log "[DRYRUN] $($folders.Count) dossier(s), $($files.Count) fichier(s) à copier." 'INFO'
+            $stats.Folders += $folders.Count; $stats.Files += $files.Count
+            continue
+        }
+
+        # 1) Recréer l'arborescence (séquentiel, par profondeur) côté cible.
+        foreach ($frel in ($folders | Sort-Object { $_.Split('/').Count })) {
+            try { Resolve-PnPFolder -SiteRelativePath $frel -Connection $TargetConn -ErrorAction Stop | Out-Null; $stats.Folders++ }
+            catch { $stats.Errors++; Write-CopyError -Path $frel -Message $_.Exception.Message }
+        }
+
+        # 2) Copier les fichiers (parallèle ou séquentiel).
+        if ($parallel -and $files.Count -gt 0) {
+            # Répartir en N lots ; chaque runspace ouvre UNE connexion source + cible.
+            $chunks = @{}; for ($k = 0; $k -lt $ThrottleLimit; $k++) { $chunks[$k] = [System.Collections.Generic.List[object]]::new() }
+            for ($i = 0; $i -lt $files.Count; $i++) { $chunks[$i % $ThrottleLimit].Add($files[$i]) }
+
+            Write-Log "Copie de $($files.Count) fichier(s) sur $ThrottleLimit threads..." 'INFO'
+            $results = (0..($ThrottleLimit - 1)) | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+                $chunk = ($using:chunks)[$_]
+                if (-not $chunk -or $chunk.Count -eq 0) { return [pscustomobject]@{ Ok = 0; Err = 0; Errors = @() } }
+                Import-Module PnP.PowerShell -ErrorAction SilentlyContinue
+                $cid = $using:ClientId; $tp = $using:Thumbprint; $tn = $using:tenant
+                $su = $using:srcSiteUrl; $du = $using:dstSiteUrl
+                try {
+                    $sc = Connect-PnPOnline -Url $su -ClientId $cid -Thumbprint $tp -Tenant $tn -ReturnConnection -ErrorAction Stop
+                    $dc = Connect-PnPOnline -Url $du -ClientId $cid -Thumbprint $tp -Tenant $tn -ReturnConnection -ErrorAction Stop
                 }
-                else {
-                    # 1) Garantir le dossier parent côté cible (supprime toute dépendance d'ordre).
-                    if ($parentRelDir) {
-                        Resolve-PnPFolder -SiteRelativePath $parentRelDir -Connection $TargetConn -ErrorAction Stop | Out-Null
+                catch { return [pscustomobject]@{ Ok = 0; Err = $chunk.Count; Errors = @("Connexion runspace: $($_.Exception.Message)") } }
+                $ok = 0; $er = 0; $errs = [System.Collections.Generic.List[string]]::new()
+                foreach ($f in $chunk) {
+                    try {
+                        $stream = Get-PnPFile -Url $f.Src -AsMemoryStream -Connection $sc -ErrorAction Stop
+                        Add-PnPFile -FileName $f.Leaf -Folder $f.Folder -Stream $stream -Connection $dc -ErrorAction Stop | Out-Null
+                        $ok++
                     }
-                    # 2) Copie cross-site fiable : download (source) -> upload (cible).
-                    #    Évite la limite same-site-collection de Copy-PnPFile.
-                    Invoke-WithRetry -Operation "copie '$leaf'" -Action {
-                        $stream = Get-PnPFile -Url $serverRel -AsMemoryStream -Connection $SourceConn -ErrorAction Stop
-                        Add-PnPFile -FileName $leaf -Folder $parentRelDir -Stream $stream `
-                            -Connection $TargetConn -ErrorAction Stop | Out-Null
+                    catch { $er++; $errs.Add("$($f.Src) :: $($_.Exception.Message)") }
+                }
+                [pscustomobject]@{ Ok = $ok; Err = $er; Errors = $errs }
+            }
+            foreach ($r in $results) {
+                $stats.Files += $r.Ok; $stats.Errors += $r.Err
+                foreach ($e in $r.Errors) {
+                    $p, $m = $e -split ' :: ', 2
+                    Write-CopyError -Path $p -Message $m
+                }
+            }
+            Write-Log "Lot terminé : $($stats.Files) copié(s), $($stats.Errors) erreur(s)." 'OK'
+        }
+        else {
+            $n = 0; $tot = [math]::Max($files.Count, 1)
+            foreach ($f in $files) {
+                $n++
+                Write-Progress -Id 2 -ParentId 1 -Activity "Bibliothèque '$($lib.Title)'" -Status "$n/$tot : $($f.Leaf)" -PercentComplete (($n / $tot) * 100)
+                try {
+                    Invoke-WithRetry -Operation "copie '$($f.Leaf)'" -Action {
+                        $stream = Get-PnPFile -Url $f.Src -AsMemoryStream -Connection $SourceConn -ErrorAction Stop
+                        Add-PnPFile -FileName $f.Leaf -Folder $f.Folder -Stream $stream -Connection $TargetConn -ErrorAction Stop | Out-Null
                     } | Out-Null
                     $stats.Files++
                 }
+                catch { $stats.Errors++; Write-CopyError -Path $f.Src -Message $_.Exception.Message }
             }
-            catch {
-                $stats.Errors++
-                Write-Log "Erreur sur '$serverRel' : $($_.Exception.Message)" 'ERROR'
-            }
+            Write-Progress -Id 2 -ParentId 1 -Activity "Bibliothèque '$($lib.Title)'" -Completed
         }
-        Write-Progress -Id 2 -ParentId 1 -Activity "Bibliothèque '$($lib.Title)'" -Completed
     }
 
     Write-Log ("Copie terminée : {0} biblio, {1} fichiers, {2} dossiers, {3} erreur(s)." -f `

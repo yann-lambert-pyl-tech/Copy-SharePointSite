@@ -96,9 +96,12 @@ Colonnes reconnues (voir [`samples/operations.csv`](samples/operations.csv)) :
 | `-TenantId` | | ID de tenant (GUID) ou domaine `*.onmicrosoft.com` pour l'auth certificat |
 | `-ManualBuild` | | (Team) Construction **100% synchrone** (sans clone async) : équipe + canaux + contenu. Requiert `-Owner` |
 | `-ForceContentCopy` | | (Team) Copie **synchrone forcée** du contenu SharePoint après le clone |
+| `-ThrottleLimit` | | Threads de copie (PS7, défaut 4 ; parallélisme actif en auth certificat) |
 | `-MuteNotifications` | | Désactive l'email de bienvenue du groupe (via `Set-UnifiedGroup`) |
 | `-LogPath` | | Dossier des logs / modèle exporté (défaut : `.\_SPCopy_Logs`) |
 | `-DryRun` | | Simulation : n'écrit **rien** côté cible |
+
+> **Permissions app-only (certificat)** : la copie de fichiers passe par l'**API SharePoint** (CSOM/REST), distincte de Graph. Si le Teams clone/owner fonctionne mais que la copie renvoie **« Accès refusé »**, l'app a les droits *Graph* mais pas *SharePoint* : il faut **`Sites.FullControl.All` (API SharePoint, consentement admin)** ou **`Sites.Selected`** accordé explicitement sur les sites **source ET cible** (`Grant-PnPAzureADAppSitePermission`). Une équipe/site **source archivé** est en lecture seule.
 
 > **Authentification** : par défaut **interactive** (navigateur + MFA). Si `-Thumbprint` est fourni avec `-ClientId`, le script bascule en **app-only par certificat** (le certificat doit être présent dans le magasin de la machine). Le domaine tenant est déduit de l'URL ; si le préfixe SharePoint diffère du tenant (ex. `groupeeiffage.sharepoint.com` mais tenant `eiffage.onmicrosoft.com`), précisez `-TenantId` (GUID ou domaine). L'app doit avoir les permissions d'application adéquates (`Sites.FullControl.All`, et `Group.ReadWrite.All` pour Teams).
 
