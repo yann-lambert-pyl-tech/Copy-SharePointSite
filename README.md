@@ -90,9 +90,13 @@ Colonnes reconnues (voir [`samples/operations.csv`](samples/operations.csv)) :
 | `-TargetType` | | `CommunicationSite` (défaut) ou `TeamSite` |
 | `-Owner` | | UPN du propriétaire du nouveau site |
 | `-IncludeContent` | | Inclut pages et fichiers de branding dans le modèle |
-| `-ClientId` | | ClientId d'une App Registration Entra ID (auth interactive) |
+| `-ClientId` | | ClientId d'une App Registration Entra ID (requis pour l'auth certificat) |
+| `-AppName` | | Nom convivial de l'app (étiquette logs/rapport) |
+| `-Thumbprint` | | Empreinte du certificat → auth **app-only** (serveur, sans MFA) |
 | `-LogPath` | | Dossier des logs / modèle exporté (défaut : `.\_SPCopy_Logs`) |
 | `-DryRun` | | Simulation : n'écrit **rien** côté cible |
+
+> **Authentification** : par défaut **interactive** (navigateur + MFA). Si `-Thumbprint` est fourni avec `-ClientId`, le script bascule en **app-only par certificat** (le certificat doit être présent dans le magasin de la machine ; le domaine tenant est déduit de l'URL). L'app doit avoir les permissions d'application adéquates (`Sites.FullControl.All`, et `Group.ReadWrite.All` pour Teams).
 
 ---
 

@@ -75,8 +75,17 @@
     Inclure les éléments de liste / fichiers dans l'extraction du modèle (structure + données).
 
 .PARAMETER ClientId
-    (Optionnel) ClientId d'une App Registration Entra ID pour l'auth interactive PnP.
-    Si absent, le ClientId par défaut de PnP.PowerShell est utilisé.
+    ClientId (GUID) de l'App Registration Entra ID. Requis pour l'auth par certificat ;
+    optionnel en interactif (sinon ClientId par défaut de PnP.PowerShell).
+
+.PARAMETER AppName
+    (Optionnel) Nom convivial de l'App Registration, utilisé comme étiquette dans les
+    logs / le rapport. N'intervient pas dans l'authentification elle-même.
+
+.PARAMETER Thumbprint
+    (Optionnel) Empreinte du certificat (présent dans le magasin de certificats) pour
+    une authentification APP-ONLY par certificat — idéale sur serveur, sans MFA.
+    Requiert -ClientId ; le domaine tenant est déduit de l'URL.
 
 .PARAMETER LogPath
     Dossier de sortie des logs et du modèle exporté. Défaut : .\_SPCopy_Logs
@@ -103,6 +112,13 @@
 .EXAMPLE
     # Lot : enchaîne toutes les opérations du CSV, en simulation pour valider d'abord
     .\Copy-SharePointSite.ps1 -ConfigCsv .\operations.csv -DryRun
+
+.EXAMPLE
+    # Serveur : authentification APP-ONLY par certificat (sans MFA)
+    .\Copy-SharePointSite.ps1 -SourceTeamId 0a1b2c3d-4e5f-6789-abcd-ef0123456789 `
+        -NewTeamName "Projet Alpha (copie)" -TenantUrl https://contoso.sharepoint.com `
+        -ClientId 66e9174a-d89b-4eb1-93b2-edc831f1aa85 `
+        -AppName "SP-Rollback-App" -Thumbprint A1B2C3D4E5F6...90 -IncludePermissions
 
 .NOTES
     Auteur  : Pyl.Tech
@@ -168,6 +184,15 @@ param(
 
     [Parameter(Mandatory = $false)]
     [string]$ClientId,
+
+    # --- Authentification par CERTIFICAT (app-only, idéal serveur sans MFA) ---
+    # Si -Thumbprint est fourni : connexion app-only via ClientId + Thumbprint + Tenant
+    # (le domaine tenant est déduit de l'URL). -AppName sert d'étiquette (logs/rapport).
+    [Parameter(Mandatory = $false)]
+    [string]$AppName,
+
+    [Parameter(Mandatory = $false)]
+    [string]$Thumbprint,
 
     [Parameter(Mandatory = $false)]
     [string]$LogPath = (Join-Path -Path $PSScriptRoot -ChildPath '_SPCopy_Logs'),
@@ -403,16 +428,46 @@ function Initialize-Prerequisites {
 #region ░░ STREAM 3 : Authentification ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 # Connexion PnP interactive (navigateur + MFA). Retourne une connexion réutilisable.
 
+function Get-TenantDomain {
+    # Déduit le domaine tenant (xxx.onmicrosoft.com) depuis une URL SharePoint.
+    param([Parameter(Mandatory = $true)][string]$AnyUrl)
+    if ($AnyUrl -match '^https://([^.]+)\.sharepoint\.com') {
+        $name = $Matches[1] -replace '-admin$', ''
+        return "$name.onmicrosoft.com"
+    }
+    throw "Impossible de déduire le domaine tenant depuis : $AnyUrl"
+}
+
+function New-PnPConnectionParams {
+    # Construit les paramètres de Connect-PnPOnline selon le mode d'auth :
+    #   - Certificat (app-only) si -Thumbprint fourni  -> idéal serveur, sans MFA
+    #   - Interactif (navigateur + MFA) sinon
+    param([Parameter(Mandatory = $true)][string]$Url)
+    $p = @{ Url = $Url; ReturnConnection = $true; ErrorAction = 'Stop' }
+    if ($Thumbprint) {
+        if (-not $ClientId) { throw "Auth par certificat : -ClientId est requis avec -Thumbprint." }
+        $tenantDomain = Get-TenantDomain -AnyUrl $Url
+        $p['ClientId']   = $ClientId
+        $p['Thumbprint'] = $Thumbprint
+        $p['Tenant']     = $tenantDomain
+        Write-Log ("Auth par CERTIFICAT (app-only{0}) : ClientId=$ClientId, Thumbprint=$Thumbprint, Tenant=$tenantDomain" -f $(if ($AppName) { " '$AppName'" } else { '' })) 'INFO'
+    }
+    else {
+        $p['Interactive'] = $true
+        if ($ClientId) { $p['ClientId'] = $ClientId }
+        Write-Log "Auth INTERACTIVE (navigateur + MFA)." 'INFO'
+    }
+    return $p
+}
+
 function Connect-Site {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Url,
         [string]$Label = 'site'
     )
-    Write-Log "Connexion interactive au $Label : $Url" 'STEP'
-    $params = @{ Url = $Url; Interactive = $true; ReturnConnection = $true; ErrorAction = 'Stop' }
-    if ($ClientId) { $params['ClientId'] = $ClientId }
-
+    Write-Log "Connexion au $Label : $Url" 'STEP'
+    $params = New-PnPConnectionParams -Url $Url
     $conn = Invoke-WithRetry -Operation "connexion $Label" -Action { Connect-PnPOnline @params }
     $web  = Get-PnPWeb -Connection $conn
     Write-Log "Connecté au $Label : '$($web.Title)'." 'OK'
@@ -701,9 +756,8 @@ function Connect-Tenant {
     # Connexion interactive pour les opérations Graph/Teams (token Graph via PnP).
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string]$Url)
-    Write-Log "Connexion interactive (Graph/Teams) : $Url" 'STEP'
-    $params = @{ Url = $Url; Interactive = $true; ReturnConnection = $true; ErrorAction = 'Stop' }
-    if ($ClientId) { $params['ClientId'] = $ClientId }
+    Write-Log "Connexion (Graph/Teams) : $Url" 'STEP'
+    $params = New-PnPConnectionParams -Url $Url
     $conn = Invoke-WithRetry -Operation 'connexion tenant' -Action { Connect-PnPOnline @params }
     Write-Log "Connecté au tenant pour Graph/Teams." 'OK'
     return $conn
@@ -891,7 +945,8 @@ function Invoke-CopyOperation {
         [int]$Count = 1
     )
     Set-OperationContext -Op $Op -Index $Index
-    $aclLabel = if ($IncludePermissions) { 'Copiées' } else { 'Non copiées' }
+    $aclLabel  = if ($IncludePermissions) { 'Copiées' } else { 'Non copiées' }
+    $authLabel = if ($Thumbprint) { "Certificat$(if ($AppName) { " ($AppName)" })" } else { 'Interactif' }
     $result = [ordered]@{
         Index = $Index; Mode = $script:OpMode; Target = ''; Status = 'OK'
         Files = 0; Errors = 0; Message = ''
@@ -908,6 +963,7 @@ function Invoke-CopyOperation {
                 'Tenant'        = $TenantUrl
                 'Visibilité'    = $Visibility
                 'ACL (membres)' = $aclLabel
+                'Auth'          = $authLabel
                 'Mode'          = $(if ($DryRun) { 'DRYRUN (simulation)' } else { 'Réel' })
                 'Log'           = $script:LogFile
             })
@@ -950,6 +1006,7 @@ function Invoke-CopyOperation {
                 'Type'    = $TargetType
                 'Contenu' = $(if ($IncludeContent) { 'Inclus' } else { 'Structure seule' })
                 'ACL'     = $aclLabel
+                'Auth'    = $authLabel
                 'Mode'    = $(if ($DryRun) { 'DRYRUN (simulation)' } else { 'Réel' })
                 'Log'     = $script:LogFile
             })
