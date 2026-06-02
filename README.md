@@ -94,6 +94,8 @@ Colonnes reconnues (voir [`samples/operations.csv`](samples/operations.csv)) :
 | `-AppName` | | Nom convivial de l'app (étiquette logs/rapport) |
 | `-Thumbprint` | | Empreinte du certificat → auth **app-only** (serveur, sans MFA) |
 | `-TenantId` | | ID de tenant (GUID) ou domaine `*.onmicrosoft.com` pour l'auth certificat |
+| `-ForceContentCopy` | | (Team) Copie **synchrone forcée** du contenu SharePoint après le clone |
+| `-MuteNotifications` | | Désactive l'email de bienvenue du groupe (via `Set-UnifiedGroup`) |
 | `-LogPath` | | Dossier des logs / modèle exporté (défaut : `.\_SPCopy_Logs`) |
 | `-DryRun` | | Simulation : n'écrit **rien** côté cible |
 
@@ -120,7 +122,9 @@ Colonnes reconnues (voir [`samples/operations.csv`](samples/operations.csv)) :
 ## ⚠️ Limites connues
 
 - `Get-PnPSiteTemplate` ne capture pas tout : workflows, certains web parts custom, **versions d'historique** des fichiers.
-- La copie de fichiers utilise `Copy-PnPFile` (côté serveur, sans téléchargement local).
+- La copie forcée de fichiers utilise un **download/upload** cross-site (lecture source, écriture cible).
+- **Source archivée / lecture seule** : la **lecture** (clone, extraction, copie de contenu) fonctionne. Une **équipe archivée** est en lecture seule → l'ajout d'owner/membre échoue tant qu'elle n'est pas désarchivée (le script avertit via `isArchived`). Un **site archivé** (SharePoint Advanced Management) doit être réactivé avant lecture. La cible étant nouvellement créée, l'écriture n'est jamais bloquée par un verrou.
+- **Notifications** : seul l'email de bienvenue du groupe est désactivable (`-MuteNotifications` via `Set-UnifiedGroup`). Les notifications Teams in-app d'ajout ne sont pas supprimables par API.
 
 ---
 

@@ -92,6 +92,16 @@
     -Tenant lors de l'auth par certificat. À renseigner quand le préfixe SharePoint
     diffère du domaine du tenant (déduction impossible depuis l'URL).
 
+.PARAMETER ForceContentCopy
+    (Mode TEAM) Après le clone, copie SYNCHRONE et forcée du contenu des bibliothèques
+    SharePoint (site source -> site de la nouvelle équipe), avec progression. Garantit
+    la copie des fichiers sans dépendre du traitement asynchrone de Graph.
+
+.PARAMETER MuteNotifications
+    Désactive l'email de bienvenue du groupe lors de l'ajout de membres/owner (via
+    Set-UnifiedGroup si Exchange Online est connecté). Les notifications Teams in-app
+    ne sont pas supprimables via API.
+
 .PARAMETER LogPath
     Dossier de sortie des logs et du modèle exporté. Défaut : .\_SPCopy_Logs
 
@@ -125,6 +135,12 @@
         -ClientId 66e9174a-d89b-4eb1-93b2-edc831f1aa85 `
         -AppName "SP-Rollback-App" -Thumbprint A1B2C3D4E5F6...90 `
         -TenantId 11112222-3333-4444-5555-666677778888 -IncludePermissions
+
+.EXAMPLE
+    # Teams : clone + copie forcée du contenu + owner, sans polluer de notifications
+    .\Copy-SharePointSite.ps1 -SourceTeamId 0a1b2c3d-4e5f-6789-abcd-ef0123456789 `
+        -NewTeamName "Projet Alpha (copie)" -TenantUrl https://contoso.sharepoint.com `
+        -Owner chef.projet@contoso.com -ForceContentCopy -MuteNotifications -IncludePermissions
 
 .NOTES
     Auteur  : Pyl.Tech
@@ -187,6 +203,16 @@ param(
     # ACL : copie des permissions (groupes/rôles du site, ou membres/owners de l'équipe).
     [Parameter(Mandatory = $false)]
     [switch]$IncludePermissions,
+
+    # Mode TEAM : copie SYNCHRONE et forcée du contenu SharePoint après le clone
+    # (ne dépend pas de l'asynchrone Graph pour les fichiers).
+    [Parameter(Mandatory = $false)]
+    [switch]$ForceContentCopy,
+
+    # Désactive l'email de bienvenue du groupe lors de l'ajout de membres/owner
+    # (via Set-UnifiedGroup si Exchange Online est connecté). Limite le bruit.
+    [Parameter(Mandatory = $false)]
+    [switch]$MuteNotifications,
 
     [Parameter(Mandatory = $false)]
     [string]$ClientId,
@@ -816,18 +842,23 @@ function Copy-Team {
 
     Write-Log "Clonage de l'équipe Teams source ($SourceTeamId)..." 'STEP'
 
-    # Vérifie que l'équipe source existe.
+    # Vérifie que l'équipe source existe + état d'archivage.
     $srcTeam = Invoke-WithRetry -Operation 'lecture équipe source' -Action {
-        Invoke-PnPGraphMethod -Url "v1.0/teams/$SourceTeamId" -Method Get -Connection $Connection
+        Invoke-PnPGraphMethod -Url "v1.0/teams/$($SourceTeamId)?`$select=displayName,isArchived" -Method Get -Connection $Connection
     }
     Write-Log "Équipe source : '$($srcTeam.displayName)'." 'OK'
+    if ($srcTeam.isArchived) {
+        # Source archivée = lecture seule : le clone et la lecture du contenu fonctionnent,
+        # mais c'est à signaler (rien ne sera modifié côté source de toute façon).
+        Write-Log "Équipe source ARCHIVÉE (lecture seule) : clonage/lecture OK, aucune écriture côté source." 'WARN'
+    }
 
     # mailNickname : alias dérivé du nouveau nom (alphanumérique uniquement).
     $alias = ($NewTeamName -replace '[^a-zA-Z0-9]', '')
     if (-not $alias) { $alias = "team$($script:StartTime.ToString('yyyyMMddHHmmss'))" }
 
     # -Owner en mode Team : le clone Graph rend l'appelant propriétaire ;
-    # l'owner explicite est attribué après coup (étape dédiée via Add-TeamOwner).
+    # l'owner explicite est attribué après coup (étape dédiée via Set-GroupOwner).
     if ($Owner) {
         Write-Log "Propriétaire '$Owner' : sera attribué à la nouvelle équipe après le clone." 'INFO'
     }
@@ -868,19 +899,15 @@ function Copy-Team {
     return [ordered]@{ Mode = 'Team'; Source = $srcTeam.displayName; NewTeam = $NewTeamName; Alias = $alias; Parts = $body.partsToClone; Status = 'Submitted' }
 }
 
-function Add-TeamOwner {
-    # Attend que l'équipe clonée existe (clone asynchrone), puis attribue le propriétaire.
-    # Recherche le groupe par mailNickname, puis ajoute l'utilisateur en owner ET membre
-    # (un owner d'équipe Teams doit aussi être membre). Renvoie l'id du groupe.
+function Wait-ClonedGroup {
+    # Attend l'apparition du groupe cloné (clone asynchrone) via recherche par mailNickname.
+    # Renvoie l'objet groupe (id, displayName). Lève si timeout.
     param(
         [Parameter(Mandatory = $true)][string]$Alias,
-        [Parameter(Mandatory = $true)][string]$OwnerUpn,
         [Parameter(Mandatory = $true)]$Connection,
         [int]$TimeoutMinutes = 10
     )
-    Write-Log "Attribution du propriétaire '$OwnerUpn' à l'équipe clonée..." 'STEP'
-
-    # 1) Attendre l'apparition du groupe cloné (recherche par mailNickname).
+    Write-Log "Attente de la disponibilité de l'équipe clonée (clone asynchrone)..." 'INFO'
     $filterValue = [uri]::EscapeDataString("mailNickname eq '$Alias'")
     $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
     $group = $null
@@ -893,34 +920,89 @@ function Add-TeamOwner {
         else { Write-Log "Équipe pas encore prête, nouvelle vérification dans 15s..." 'INFO' }
     } while (-not $group -and (Get-Date) -lt $deadline)
 
-    if (-not $group) {
-        throw "Équipe clonée introuvable (mailNickname '$Alias') après $TimeoutMinutes min — propriétaire non attribué."
-    }
+    if (-not $group) { throw "Équipe clonée introuvable (mailNickname '$Alias') après $TimeoutMinutes min." }
     Write-Log "Groupe cloné détecté : '$($group.displayName)' ($($group.id))." 'OK'
+    return $group
+}
 
-    # 2) Résoudre l'utilisateur cible.
+function Disable-GroupWelcomeMail {
+    # Mute l'email de bienvenue du groupe (seul levier fiable pour limiter le bruit).
+    # Utilise Exchange Online (Set-UnifiedGroup) si disponible ; sinon avertit honnêtement.
+    param([Parameter(Mandatory = $true)][string]$GroupId)
+    if (Get-Command -Name 'Set-UnifiedGroup' -ErrorAction SilentlyContinue) {
+        try {
+            Set-UnifiedGroup -Identity $GroupId -UnifiedGroupWelcomeMessageEnabled:$false -ErrorAction Stop
+            Write-Log "Notifications : email de bienvenue du groupe désactivé (Set-UnifiedGroup)." 'OK'
+        }
+        catch { Write-Log "Impossible de désactiver l'email de bienvenue : $($_.Exception.Message)" 'WARN' }
+    }
+    else {
+        Write-Log "Mute partiel : Set-UnifiedGroup indisponible (Exchange Online non connecté). L'email de bienvenue ne peut pas être désactivé ; les notifications Teams in-app ne sont pas supprimables via API." 'WARN'
+    }
+}
+
+function Set-GroupOwner {
+    # Ajoute un utilisateur en owner ET membre d'un groupe (un owner Teams doit être membre).
+    # Idempotent ('already exist' ignoré). -Mute désactive l'email de bienvenue au préalable.
+    param(
+        [Parameter(Mandatory = $true)][string]$GroupId,
+        [Parameter(Mandatory = $true)][string]$OwnerUpn,
+        [Parameter(Mandatory = $true)]$Connection,
+        [switch]$Mute
+    )
+    Write-Log "Attribution du propriétaire '$OwnerUpn'..." 'STEP'
+    if ($Mute) { Disable-GroupWelcomeMail -GroupId $GroupId }
+
     $user = Invoke-WithRetry -Operation 'résolution du compte owner' -Action {
         Invoke-PnPGraphMethod -Url "v1.0/users/$($OwnerUpn)?`$select=id,userPrincipalName" -Method Get -Connection $Connection
     }
     $ref = @{ '@odata.id' = "https://graph.microsoft.com/v1.0/directoryObjects/$($user.id)" }
 
-    # 3) Ajouter en owner ET en membre (idempotent : 'already exist' est ignoré).
     foreach ($rel in 'members', 'owners') {
         try {
             Invoke-WithRetry -Operation "ajout dans $rel" -Action {
-                Invoke-PnPGraphMethod -Url "v1.0/groups/$($group.id)/$rel/`$ref" -Method Post -Content $ref -Connection $Connection
+                Invoke-PnPGraphMethod -Url "v1.0/groups/$GroupId/$rel/`$ref" -Method Post -Content $ref -Connection $Connection
             } | Out-Null
             Write-Log "Ajouté dans '$rel' : $OwnerUpn." 'OK'
         }
         catch {
-            if ("$($_.Exception.Message)" -match 'already exist') {
-                Write-Log "$OwnerUpn déjà présent dans '$rel'." 'INFO'
-            }
+            if ("$($_.Exception.Message)" -match 'already exist') { Write-Log "$OwnerUpn déjà présent dans '$rel'." 'INFO' }
             else { throw }
         }
     }
-    Write-Log "Propriétaire '$OwnerUpn' attribué à l'équipe '$($group.displayName)'." 'OK'
-    return $group.id
+    Write-Log "Propriétaire '$OwnerUpn' attribué." 'OK'
+}
+
+function Get-GroupSiteUrl {
+    # Renvoie l'URL du site SharePoint associé à un groupe/équipe.
+    param(
+        [Parameter(Mandatory = $true)][string]$GroupId,
+        [Parameter(Mandatory = $true)]$Connection
+    )
+    $site = Invoke-WithRetry -Operation 'lecture site du groupe' -Action {
+        Invoke-PnPGraphMethod -Url "v1.0/groups/$GroupId/sites/root?`$select=webUrl" -Method Get -Connection $Connection
+    }
+    if (-not $site.webUrl) { throw "URL SharePoint introuvable pour le groupe $GroupId." }
+    return $site.webUrl
+}
+
+function Copy-TeamContent {
+    # Copie FORCÉE et synchrone du contenu : bibliothèques de documents du site de l'équipe
+    # source -> site de la nouvelle équipe (réutilise Copy-LibrariesContent). Renvoie les stats.
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceTeamId,
+        [Parameter(Mandatory = $true)][string]$NewGroupId,
+        [Parameter(Mandatory = $true)]$Connection
+    )
+    Write-Log "Copie forcée du contenu SharePoint des équipes..." 'STEP'
+    $srcUrl = Get-GroupSiteUrl -GroupId $SourceTeamId -Connection $Connection
+    $dstUrl = Get-GroupSiteUrl -GroupId $NewGroupId  -Connection $Connection
+    Write-Log "Site source : $srcUrl" 'INFO'
+    Write-Log "Site cible  : $dstUrl" 'INFO'
+
+    $srcConn = Connect-Site -Url $srcUrl -Label 'site équipe source'
+    $dstConn = Connect-Site -Url $dstUrl -Label 'site équipe cible'
+    return Copy-LibrariesContent -SourceConn $srcConn -TargetConn $dstConn
 }
 #endregion
 
@@ -1029,21 +1111,36 @@ function Invoke-CopyOperation {
                 'Pré-requis (module PnP)',
                 'Connexion tenant (Graph)',
                 'Clonage de l''équipe',
-                'Attribution du propriétaire'
+                'Attribution du propriétaire',
+                'Copie forcée du contenu'
             )
             Invoke-Step 1 { Initialize-Prerequisites }
             $tenantConn = Invoke-Step 2 { Connect-Tenant -Url $TenantUrl }
             $teamResult = Invoke-Step 3 { Copy-Team -Connection $tenantConn }
 
-            # Étape 4 : attribuer le propriétaire (poll + ajout owner/membre).
-            if ($Owner -and -not $DryRun -and $teamResult -and $teamResult.Status -eq 'Submitted') {
-                Invoke-Step 4 { Add-TeamOwner -Alias $teamResult.Alias -OwnerUpn $Owner -Connection $tenantConn }
+            # Si owner et/ou copie forcée : on attend que l'équipe clonée soit disponible.
+            $newGroup = $null
+            $needGroup = ($Owner -or $ForceContentCopy) -and -not $DryRun -and $teamResult -and $teamResult.Status -eq 'Submitted'
+            if ($needGroup) {
+                $newGroup = Wait-ClonedGroup -Alias $teamResult.Alias -Connection $tenantConn
+            }
+
+            # Étape 4 : attribuer le propriétaire (owner + membre).
+            if ($Owner -and $newGroup) {
+                Invoke-Step 4 { Set-GroupOwner -GroupId $newGroup.id -OwnerUpn $Owner -Connection $tenantConn -Mute:$MuteNotifications }
             }
             else {
-                $reason = if (-not $Owner) { 'aucun -Owner spécifié' }
-                          elseif ($DryRun) { 'DryRun' }
-                          else { 'clone non soumis' }
-                Set-StepSkipped 4 $reason
+                Set-StepSkipped 4 $(if (-not $Owner) { 'aucun -Owner spécifié' } elseif ($DryRun) { 'DryRun' } else { 'clone non soumis' })
+            }
+
+            # Étape 5 : copie forcée et synchrone du contenu SharePoint.
+            $teamCopyStats = $null
+            if ($ForceContentCopy -and $newGroup) {
+                $teamCopyStats = Invoke-Step 5 { Copy-TeamContent -SourceTeamId $SourceTeamId -NewGroupId $newGroup.id -Connection $tenantConn }
+                if ($teamCopyStats) { $result.Files = $teamCopyStats.Files; $result.Errors = $teamCopyStats.Errors }
+            }
+            else {
+                Set-StepSkipped 5 $(if (-not $ForceContentCopy) { '-ForceContentCopy non demandé' } elseif ($DryRun) { 'DryRun' } else { 'clone non soumis' })
             }
 
             Show-StepChecklist
@@ -1053,6 +1150,7 @@ function Invoke-CopyOperation {
                 'Éléments'      = $(if ($teamResult) { $teamResult.Parts } else { '-' })
                 'Statut'        = $(if ($teamResult) { $teamResult.Status } else { '-' })
                 'ACL (membres)' = $aclLabel
+                'Contenu forcé' = $(if ($teamCopyStats) { "$($teamCopyStats.Files) fichier(s), $($teamCopyStats.Errors) erreur(s)" } else { 'non' })
             })
         }
         else {
