@@ -94,8 +94,9 @@
 
 .PARAMETER ManualBuild
     (Mode TEAM) Construction SYNCHRONE sans clone asynchrone : crée l'équipe via
-    New-PnPTeamsTeam, recrée les canaux standard de la source, puis copie le contenu.
-    Requiert -Owner. Les onglets / apps / conversations ne sont PAS repris (clone only).
+    New-PnPTeamsTeam, recrée les canaux standard de la source, reprend (best-effort)
+    les onglets Website et Bibliothèque de documents, puis copie le contenu.
+    Requiert -Owner. Apps installées et conversations NON reprises (clone only).
 
 .PARAMETER ForceContentCopy
     (Mode TEAM) Après le clone, copie SYNCHRONE et forcée du contenu des bibliothèques
@@ -919,8 +920,13 @@ function Copy-Team {
             }
             catch { Write-Log "Canal '$($ch.displayName)' non recréé : $($_.Exception.Message)" 'WARN' }
         }
-        Write-Log "Canaux recréés : $created (onglets/apps/conversations NON repris en mode manuel)." 'OK'
-        return [ordered]@{ Mode = 'Team'; Source = $srcTeam.displayName; NewTeam = $NewTeamName; Alias = $alias; Parts = "manuel: $created canal(aux) + contenu"; Status = 'Created'; GroupId = $groupId }
+        Write-Log "Canaux recréés : $created." 'OK'
+
+        # Reprise best-effort des onglets website / bibliothèque de documents.
+        $tabsCopied = Copy-TeamTabs -SourceTeamId $SourceTeamId -NewTeamId $groupId -Connection $Connection
+        Write-Log "Build manuel : apps/conversations NON repris (clone only)." 'INFO'
+
+        return [ordered]@{ Mode = 'Team'; Source = $srcTeam.displayName; NewTeam = $NewTeamName; Alias = $alias; Parts = "manuel: $created canal(aux), $tabsCopied onglet(s) + contenu"; Status = 'Created'; GroupId = $groupId }
     }
 
     # ───────── MODE CLONE : asynchrone (Graph clone team) ─────────
@@ -955,6 +961,68 @@ function Copy-Team {
     Write-Log "Demande de clonage envoyée (traitement asynchrone côté Microsoft 365)." 'OK'
 
     return [ordered]@{ Mode = 'Team'; Source = $srcTeam.displayName; NewTeam = $NewTeamName; Alias = $alias; Parts = $body.partsToClone; Status = 'Submitted'; GroupId = $null }
+}
+
+function Copy-TeamTabs {
+    # Recrée (best-effort) les onglets 'Website' et 'Bibliothèque de documents' des canaux
+    # source vers les canaux de même nom de la nouvelle équipe. Renvoie le nombre d'onglets créés.
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceTeamId,
+        [Parameter(Mandatory = $true)][string]$NewTeamId,
+        [Parameter(Mandatory = $true)]$Connection
+    )
+    Write-Log "Reprise des onglets (website / bibliothèque) sur les canaux..." 'STEP'
+    # Apps Teams supportées par cette reprise (ids catalogue bien connus).
+    $allowed = @('com.microsoft.teamspace.tab.web', 'com.microsoft.teamspace.tab.files.sharepoint')
+
+    # Index des canaux de la nouvelle équipe par displayName.
+    $newMap = @{}
+    $newCh = Invoke-WithRetry -Operation 'lecture canaux cible' -Action {
+        Invoke-PnPGraphMethod -Url "v1.0/teams/$NewTeamId/channels?`$select=id,displayName" -Method Get -Connection $Connection
+    }
+    foreach ($c in @($newCh.value)) { $newMap[$c.displayName] = $c.id }
+
+    $srcCh = Invoke-WithRetry -Operation 'lecture canaux source (onglets)' -Action {
+        Invoke-PnPGraphMethod -Url "v1.0/teams/$SourceTeamId/channels?`$select=id,displayName" -Method Get -Connection $Connection
+    }
+
+    $copied = 0
+    foreach ($sc in @($srcCh.value)) {
+        $targetChId = $newMap[$sc.displayName]
+        if (-not $targetChId) { continue }   # canal non recréé (ex. privé) -> on saute
+
+        $tabs = Invoke-WithRetry -Operation "lecture onglets '$($sc.displayName)'" -Action {
+            Invoke-PnPGraphMethod -Url "v1.0/teams/$SourceTeamId/channels/$($sc.id)/tabs?`$expand=teamsApp" -Method Get -Connection $Connection
+        }
+        foreach ($t in @($tabs.value)) {
+            $appId = $t.teamsApp.id
+            if ($allowed -notcontains $appId) { continue }   # on ne reprend que website / bibliothèque
+
+            $body = @{
+                displayName            = $t.displayName
+                'teamsApp@odata.bind'  = "https://graph.microsoft.com/v1.0/appCatalogs/teamsApps/$appId"
+                configuration          = @{
+                    entityId   = $t.configuration.entityId
+                    contentUrl = $t.configuration.contentUrl
+                    websiteUrl = $t.configuration.websiteUrl
+                    removeUrl  = $t.configuration.removeUrl
+                }
+            }
+            try {
+                Invoke-WithRetry -Operation "création onglet '$($t.displayName)'" -Action {
+                    Invoke-PnPGraphMethod -Url "v1.0/teams/$NewTeamId/channels/$targetChId/tabs" -Method Post -Content $body -Connection $Connection
+                } | Out-Null
+                $copied++
+                Write-Log "Onglet repris : '$($t.displayName)' sur '$($sc.displayName)'." 'OK'
+                if ($appId -eq 'com.microsoft.teamspace.tab.files.sharepoint') {
+                    Write-Log "   (onglet bibliothèque : l'URL peut encore pointer vers la bibliothèque SOURCE — à vérifier.)" 'WARN'
+                }
+            }
+            catch { Write-Log "Onglet '$($t.displayName)' non repris : $($_.Exception.Message)" 'WARN' }
+        }
+    }
+    Write-Log "Onglets repris : $copied." 'OK'
+    return $copied
 }
 
 function Wait-ClonedGroup {

@@ -126,7 +126,7 @@ Colonnes reconnues (voir [`samples/operations.csv`](samples/operations.csv)) :
 - La copie forcée de fichiers utilise un **download/upload** cross-site (lecture source, écriture cible).
 - **Source archivée / lecture seule** : la **lecture** (clone, extraction, copie de contenu) fonctionne. Une **équipe archivée** est en lecture seule → l'ajout d'owner/membre échoue tant qu'elle n'est pas désarchivée (le script avertit via `isArchived`). Un **site archivé** (SharePoint Advanced Management) doit être réactivé avant lecture. La cible étant nouvellement créée, l'écriture n'est jamais bloquée par un verrou.
 - **Notifications** : seul l'email de bienvenue du groupe est désactivable (`-MuteNotifications` via `Set-UnifiedGroup`). Les notifications Teams in-app d'ajout ne sont pas supprimables par API.
-- **Asynchrone** : le clone Teams (`POST /teams/{id}/clone`) est asynchrone côté Microsoft 365 — c'est l'API. Pour un déroulé **100% synchrone**, utiliser `-ManualBuild` (création via `New-PnPTeamsTeam` + recréation des canaux + copie de contenu), au prix de la non-reprise des onglets/apps/conversations.
+- **Asynchrone** : le clone Teams (`POST /teams/{id}/clone`) est asynchrone côté Microsoft 365 — c'est l'API. Pour un déroulé **100% synchrone**, utiliser `-ManualBuild` (création via `New-PnPTeamsTeam` + recréation des canaux + reprise best-effort des onglets Website/Bibliothèque + copie de contenu). Les **apps installées** et les **conversations** ne sont pas reprises (seul le clone les copie). Les onglets de type **bibliothèque** peuvent encore pointer vers la source (URL à vérifier).
 
 ---
 
