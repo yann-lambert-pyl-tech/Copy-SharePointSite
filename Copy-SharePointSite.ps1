@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 7.2
 <#
 .SYNOPSIS
     Duplique un site SharePoint Online complet, OU clone une équipe Microsoft Teams.
@@ -128,10 +128,12 @@ param(
     [ValidateSet('CommunicationSite', 'TeamSite')]
     [string]$TargetType = 'CommunicationSite',
 
-    [Parameter(Mandatory = $false, ParameterSetName = 'Site')]
+    # -Owner / -IncludeContent : communs (Owner sert au site OU à l'équipe ;
+    # IncludeContent n'a d'effet qu'en mode Site, ignoré en mode Team).
+    [Parameter(Mandatory = $false)]
     [string]$Owner,
 
-    [Parameter(Mandatory = $false, ParameterSetName = 'Site')]
+    [Parameter(Mandatory = $false)]
     [switch]$IncludeContent,
 
     # --- Jeu de paramètres TEAM (clonage d'une équipe Microsoft Teams via Graph) ---
@@ -722,6 +724,12 @@ function Copy-Team {
     # mailNickname : alias dérivé du nouveau nom (alphanumérique uniquement).
     $alias = ($NewTeamName -replace '[^a-zA-Z0-9]', '')
     if (-not $alias) { $alias = "team$($script:StartTime.ToString('yyyyMMddHHmmss'))" }
+
+    # -Owner en mode Team : le clone Graph est asynchrone et rend l'appelant
+    # propriétaire ; un owner explicite doit être ajouté après coup.
+    if ($Owner) {
+        Write-Log "Propriétaire demandé : $Owner — à ajouter à la nouvelle équipe après le clone (opération asynchrone)." 'WARN'
+    }
 
     # ACL : les membres/owners ne sont clonés que si demandé.
     $parts = @('apps', 'tabs', 'settings', 'channels')
