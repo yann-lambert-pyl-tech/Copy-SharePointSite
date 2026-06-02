@@ -710,6 +710,22 @@ function Write-CopyError {
     }
 }
 
+function Test-SystemLibrary {
+    # Vrai pour les bibliothèques système (non-contenu) à exclure de la copie.
+    # Basé sur le nom du dossier racine (indépendant de la langue d'affichage).
+    param($Lib, $Connection)
+    $sysRoots = @(
+        'SiteAssets', 'Style Library', 'FormServerTemplates', 'SitePages',
+        '_catalogs', 'Lists', 'Teams Wiki Data', 'Form Templates'
+    )
+    try {
+        $rf = Get-PnPProperty -ClientObject $Lib -Property RootFolder -Connection $Connection
+        $name = ($rf.ServerRelativeUrl -split '/')[-1]
+        return ($sysRoots -contains $name)
+    }
+    catch { return $false }
+}
+
 function Copy-LibrariesContent {
     [CmdletBinding()]
     param(
@@ -737,6 +753,12 @@ function Copy-LibrariesContent {
 
     $libs = Get-PnPList -Connection $SourceConn | Where-Object { $_.BaseTemplate -eq 101 -and -not $_.Hidden }
     foreach ($lib in $libs) {
+        # On saute les bibliothèques système (SiteAssets, Style Library, etc.) :
+        # elles contiennent des fichiers protégés (OneNote, icônes) non copiables.
+        if (Test-SystemLibrary -Lib $lib -Connection $SourceConn) {
+            Write-Log "Bibliothèque système ignorée : '$($lib.Title)'." 'INFO'
+            continue
+        }
         $stats.Libraries++
         Write-Log "Bibliothèque : '$($lib.Title)' ($($lib.ItemCount) éléments)." 'INFO'
 
@@ -1146,16 +1168,16 @@ function Set-GroupOwner {
     }
     $ref = @{ '@odata.id' = "https://graph.microsoft.com/v1.0/directoryObjects/$($user.id)" }
 
+    # Ajout direct (sans Invoke-WithRetry) : 'already exist' est normal et bénin
+    # (ex. owner déjà posé par New-PnPTeamsTeam) — on ne loggue pas d'ERREUR.
     foreach ($rel in 'members', 'owners') {
         try {
-            Invoke-WithRetry -Operation "ajout dans $rel" -Action {
-                Invoke-PnPGraphMethod -Url "v1.0/groups/$GroupId/$rel/`$ref" -Method Post -Content $ref -Connection $Connection
-            } | Out-Null
+            Invoke-PnPGraphMethod -Url "v1.0/groups/$GroupId/$rel/`$ref" -Method Post -Content $ref -Connection $Connection | Out-Null
             Write-Log "Ajouté dans '$rel' : $OwnerUpn." 'OK'
         }
         catch {
             if ("$($_.Exception.Message)" -match 'already exist') { Write-Log "$OwnerUpn déjà présent dans '$rel'." 'INFO' }
-            else { throw }
+            else { Write-Log "Ajout dans '$rel' non effectué : $($_.Exception.Message)" 'WARN' }
         }
     }
     Write-Log "Propriétaire '$OwnerUpn' attribué." 'OK'
