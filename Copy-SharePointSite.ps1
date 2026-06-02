@@ -905,6 +905,15 @@ function Set-OperationContext {
         [Parameter(Mandatory = $true)]$Op,
         [int]$Index = 1
     )
+    # Les paramètres validés (ValidatePattern / ValidateSet) conservent leur contrainte
+    # sur la VARIABLE : toute ré-assignation la re-déclenche. On la retire ici car le
+    # contexte par opération réutilise ces variables avec des valeurs vides selon le mode
+    # (ex. SourceUrl vide en mode Team, SourceTeamId vide en mode Site).
+    foreach ($vn in 'SourceUrl', 'TargetUrl', 'TargetType', 'SourceTeamId', 'TenantUrl', 'Visibility') {
+        $vv = Get-Variable -Name $vn -Scope script -ErrorAction SilentlyContinue
+        if ($vv) { $vv.Attributes.Clear() }
+    }
+
     $script:OpMode      = if ($Op.Mode) { "$($Op.Mode)".Trim() } else { 'Site' }
     $script:SourceUrl   = $Op.SourceUrl
     $script:TargetUrl   = $Op.TargetUrl
