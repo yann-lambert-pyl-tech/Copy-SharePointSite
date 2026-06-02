@@ -54,6 +54,30 @@ Code organisé en **streams** (`#region`), chaque bloc autonome et commenté, av
 
 > 💡 Toujours valider en `-DryRun` sur un site jetable avant un run réel.
 
+### Traitement par lot (CSV)
+
+Enchaîne plusieurs opérations (Site **et/ou** Teams) décrites dans un fichier CSV. Chaque ligne est exécutée comme un run complet ; un échec n'interrompt pas le lot, et un résumé global est affiché puis exporté en CSV (`_SPCopy_Logs\BatchResult_*.csv`).
+
+```powershell
+# Valider tout le lot en simulation, puis le rejouer en réel
+.\Copy-SharePointSite.ps1 -ConfigCsv .\samples\operations.csv -DryRun
+.\Copy-SharePointSite.ps1 -ConfigCsv .\samples\operations.csv
+```
+
+Colonnes reconnues (voir [`samples/operations.csv`](samples/operations.csv)) :
+
+| Colonne | Pour | Description |
+|---------|------|-------------|
+| `Mode` | toutes | `Site` (défaut) ou `Team` |
+| `SourceUrl`, `TargetUrl` | Site | URLs source / nouvelle cible |
+| `TargetTitle`, `TargetType`, `Owner` | Site | options du site cible |
+| `IncludeContent` | Site | copie du contenu (`true`/`false`) |
+| `SourceTeamId`, `NewTeamName`, `TenantUrl`, `Visibility` | Team | clonage d'équipe |
+| `IncludePermissions` | toutes | copie des ACL |
+| `DryRun` | toutes | simulation pour cette ligne |
+
+> Les colonnes booléennes acceptent `true/1/yes/oui/o/x`. Les switches globaux `-DryRun` et `-IncludePermissions` s'ajoutent (OR) à chaque ligne — pratique pour forcer une simulation de tout le lot.
+
 ---
 
 ## ⚙️ Paramètres
