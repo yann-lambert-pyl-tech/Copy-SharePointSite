@@ -85,7 +85,12 @@
 .PARAMETER Thumbprint
     (Optionnel) Empreinte du certificat (présent dans le magasin de certificats) pour
     une authentification APP-ONLY par certificat — idéale sur serveur, sans MFA.
-    Requiert -ClientId ; le domaine tenant est déduit de l'URL.
+    Requiert -ClientId ; le domaine tenant est déduit de l'URL (sauf si -TenantId fourni).
+
+.PARAMETER TenantId
+    (Optionnel) ID de tenant (GUID) ou domaine xxx.onmicrosoft.com, utilisé comme
+    -Tenant lors de l'auth par certificat. À renseigner quand le préfixe SharePoint
+    diffère du domaine du tenant (déduction impossible depuis l'URL).
 
 .PARAMETER LogPath
     Dossier de sortie des logs et du modèle exporté. Défaut : .\_SPCopy_Logs
@@ -114,11 +119,12 @@
     .\Copy-SharePointSite.ps1 -ConfigCsv .\operations.csv -DryRun
 
 .EXAMPLE
-    # Serveur : authentification APP-ONLY par certificat (sans MFA)
+    # Serveur : authentification APP-ONLY par certificat (sans MFA), tenant explicite
     .\Copy-SharePointSite.ps1 -SourceTeamId 0a1b2c3d-4e5f-6789-abcd-ef0123456789 `
         -NewTeamName "Projet Alpha (copie)" -TenantUrl https://contoso.sharepoint.com `
         -ClientId 66e9174a-d89b-4eb1-93b2-edc831f1aa85 `
-        -AppName "SP-Rollback-App" -Thumbprint A1B2C3D4E5F6...90 -IncludePermissions
+        -AppName "SP-Rollback-App" -Thumbprint A1B2C3D4E5F6...90 `
+        -TenantId 11112222-3333-4444-5555-666677778888 -IncludePermissions
 
 .NOTES
     Auteur  : Pyl.Tech
@@ -193,6 +199,12 @@ param(
 
     [Parameter(Mandatory = $false)]
     [string]$Thumbprint,
+
+    # -TenantId : ID de tenant (GUID) ou domaine xxx.onmicrosoft.com pour l'auth par
+    # certificat. À fournir quand le domaine ne se déduit pas de l'URL (préfixe
+    # SharePoint différent du tenant). Sinon, déduit automatiquement de l'URL.
+    [Parameter(Mandatory = $false)]
+    [string]$TenantId,
 
     [Parameter(Mandatory = $false)]
     [string]$LogPath = (Join-Path -Path $PSScriptRoot -ChildPath '_SPCopy_Logs'),
@@ -446,11 +458,12 @@ function New-PnPConnectionParams {
     $p = @{ Url = $Url; ReturnConnection = $true; ErrorAction = 'Stop' }
     if ($Thumbprint) {
         if (-not $ClientId) { throw "Auth par certificat : -ClientId est requis avec -Thumbprint." }
-        $tenantDomain = Get-TenantDomain -AnyUrl $Url
+        # -Tenant : ID/domaine explicite si fourni, sinon déduit de l'URL.
+        $tenant = if ($TenantId) { $TenantId } else { Get-TenantDomain -AnyUrl $Url }
         $p['ClientId']   = $ClientId
         $p['Thumbprint'] = $Thumbprint
-        $p['Tenant']     = $tenantDomain
-        Write-Log ("Auth par CERTIFICAT (app-only{0}) : ClientId=$ClientId, Thumbprint=$Thumbprint, Tenant=$tenantDomain" -f $(if ($AppName) { " '$AppName'" } else { '' })) 'INFO'
+        $p['Tenant']     = $tenant
+        Write-Log ("Auth par CERTIFICAT (app-only{0}) : ClientId=$ClientId, Thumbprint=$Thumbprint, Tenant=$tenant" -f $(if ($AppName) { " '$AppName'" } else { '' })) 'INFO'
     }
     else {
         $p['Interactive'] = $true
